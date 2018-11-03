@@ -370,6 +370,7 @@ pdfdir = @pdfdir@
 prefix = @prefix@
 program_transform_name = @program_transform_name@
 psdir = @psdir@
+runstatedir = @runstatedir@
 sbindir = @sbindir@
 sharedstatedir = @sharedstatedir@
 srcdir = @srcdir@
@@ -391,7 +392,10 @@ dist_web_DATA = status.xsl \
                 statusbar.html \
                 admin.html \
                 index.html \
-                favicon.ico
+                favicon.ico \
+                error.mp3 \
+                status-json.xsl \
+                xml2json.xslt
 
 all: all-recursive
 
