@@ -10,6 +10,7 @@
 <xsl:template match="icestats/source/max_listeners"><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
 <xsl:template match="icestats/source/public"><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
 <xsl:template match="icestats/source/source_ip"><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
+<xsl:template match="icestats/source/listener" ><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
 <xsl:template match="icestats/source/slow_listeners"><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
 <xsl:template match="icestats/source/*[contains(name(), 'total_bytes')]"><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
 <xsl:template match="icestats/source/user_agent" ><xsl:if test="not(following-sibling::*)">"dummy":null}</xsl:if></xsl:template>
