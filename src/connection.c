@@ -25,6 +25,7 @@
 #endif
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <fnmatch.h>
 
 #ifdef _MSC_VER
  #include <winsock2.h>
@@ -253,7 +254,9 @@ void connection_initialize(void)
     connection_running = 0;
 #ifdef HAVE_OPENSSL
     ssl_ctx = NULL;
+#if OPENSSL_API_COMPAT < 0x10100000L
     SSL_load_error_strings();                /* readable error messages */
+#endif
     SSL_library_init();                      /* initialize library */
     ssl_mutexes = malloc(CRYPTO_num_locks() * sizeof(mutex_t));
     if (ssl_mutexes)
@@ -281,6 +284,9 @@ void connection_shutdown(void)
     CRYPTO_set_id_callback(NULL);
 #endif
     CRYPTO_set_locking_callback(NULL);
+#if OPENSSL_API_COMPAT < 0x10100000L
+    ERR_free_strings ();
+#endif
     if (ssl_mutexes)
     {
         int i;
@@ -419,6 +425,7 @@ static void get_ssl_certificate (ice_config_t *config)
  */
 int connection_read_ssl (connection_t *con, void *buf, size_t len)
 {
+    ERR_clear_error();
     int bytes = SSL_read (con->ssl, buf, len);
     int code = SSL_get_error (con->ssl, bytes);
     char err[128];
@@ -426,24 +433,28 @@ int connection_read_ssl (connection_t *con, void *buf, size_t len)
     switch (code)
     {
         case SSL_ERROR_NONE:
-        case SSL_ERROR_ZERO_RETURN:
             break;
-        case SSL_ERROR_SYSCALL:
+        case SSL_ERROR_SSL:
+        case SSL_ERROR_SYSCALL:     // avoid the ssl shutdown
+            con->sslflags |= 1;
+            // fallthru
+        case SSL_ERROR_ZERO_RETURN:
             con->error = 1;
+            // fallthru
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
             return -1;
-        default:
-            con->error = 1;
+        default:    // the rest are retryable
             ERR_error_string (ERR_get_error(), err);
             DEBUG2("error %d, %s", code, err);
-            bytes = 0;
+            return -1;
     }
     return bytes;
 }
 
 int connection_send_ssl (connection_t *con, const void *buf, size_t len)
 {
+    ERR_clear_error();
     int bytes = SSL_write (con->ssl, buf, len);
     int code = SSL_get_error (con->ssl, bytes);
     char err[128];
@@ -451,22 +462,24 @@ int connection_send_ssl (connection_t *con, const void *buf, size_t len)
     switch (code)
     {
         case SSL_ERROR_NONE:
-        case SSL_ERROR_ZERO_RETURN:
             break;
-        case SSL_ERROR_SYSCALL:
+        case SSL_ERROR_SYSCALL: // avoid the ssl shutdown
+            // DEBUG3("syscall error %d, on %s (%" PRIu64 ")", sock_error(), &con->ip[0], con->id);
+        case SSL_ERROR_SSL:
+            con->sslflags |= 1;
+            // fallthru
+        case SSL_ERROR_ZERO_RETURN:
             con->error = 1;
-            DEBUG3("syscall error %d, on %s (%" PRIu64 ")", sock_error(), &con->ip[0], con->id);
             // fallthru
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
             return -1;
         default:
-            con->error = 1;
             ERR_error_string (ERR_get_error(), err);
             DEBUG2("error %d, %s", code, err);
-            return -1;
     }
-    con->sent_bytes += bytes;
+    if (bytes > 0)
+        con->sent_bytes += bytes;
     return bytes;
 }
 #else
@@ -479,6 +492,19 @@ static void get_ssl_certificate (ice_config_t *config)
 }
 #endif /* HAVE_OPENSSL */
 
+int connection_unreadable (connection_t *con)
+{
+    if (((++con->readchk) & 15) == 15)
+    {
+        int r = sock_active (con->sock);
+        if (r == 0)
+        {
+            con->error = 1;
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /* handlers (default) for reading and writing a connection_t, no encrpytion
  * used just straight access to the socket
@@ -495,15 +521,8 @@ int connection_read (connection_t *con, void *buf, size_t len)
 
 int connection_send (connection_t *con, const void *buf, size_t len)
 {
-    if (((++con->readchk) & 7) == 7)
-    {
-        int r = sock_active (con->sock);
-        if (r == 0)
-        {
-            con->error = 1;
-            return -1;
-        }
-    }
+    if (connection_unreadable (con))
+        return -1;
     int bytes = sock_write_bytes (con->sock, buf, len);
     if (bytes < 0)
     {
@@ -606,15 +625,8 @@ int connection_bufs_send (connection_t *con, struct connection_bufs *vectors, in
     {
         if (not_ssl_connection (con))
         {
-            if (((++con->readchk) & 7) == 7)
-            {
-                int r = sock_active (con->sock);
-                if (r == 0)
-                {
-                    con->error = 1;
-                    return -1;
-                }
-            }
+            if (connection_unreadable (con))
+                return -1;
             ret = sock_writev (con->sock, p, vectors->count - i);
             if (ret < 0 && !sock_recoverable (sock_error()))
                 con->error = 1;
@@ -698,6 +710,8 @@ void connection_add_banned_ip (const char *ip, int duration)
         add_banned_ip (&banned_ip, ip, timeout);
         global_unlock();
     }
+    else
+        INFO0 ("No ban-file set up, missing tag in xml or no file referenced");
 }
 
 void connection_release_banned_ip (const char *ip)
@@ -795,6 +809,19 @@ static int accept_ip_address (char *ip)
         return 0;
     }
     return 1;
+}
+
+
+static struct xforward_entry *_find_xforward_addr (ice_config_t *config, char *ip)
+{
+    struct xforward_entry *xforward = config->xforward;
+    while (xforward)
+    {
+        if (fnmatch (xforward->ip, ip, 0) == 0)
+            break;
+        xforward = xforward->next;
+    }
+    return xforward;
 }
 
 
@@ -1152,15 +1179,26 @@ static int shoutcast_source_client (client_t *client)
             if (refbuf->data [len] == '\0')  /* no EOL yet */
                 return 0;
 
-            refbuf->data [len] = '\0';
-            snprintf (header, sizeof(header), "source:%s", refbuf->data);
+            refbuf->data [len] = '\0';  // password
+
+            // is mountpoint embedded in the password
+            const char *mount = client->server_conn->shoutcast_mount, *pw = refbuf->data;
+            char *sep = strchr (refbuf->data, ':');
+            if (sep && *pw == '/')
+            {
+                pw = sep + 1;
+                *sep = '\0';
+                mount = refbuf->data;
+            }
+            // DEBUG2 ("Using mount %s and pass %s", mount, pw);
+            snprintf (header, sizeof(header), "source:%s", pw);
             esc_header = util_base64_encode (header);
 
             len += 1 + strspn (refbuf->data+len+1, "\r\n");
             r = refbuf_new (PER_CLIENT_REFBUF_SIZE);
             snprintf (r->data, PER_CLIENT_REFBUF_SIZE,
                     "SOURCE %s HTTP/1.0\r\n" "Authorization: Basic %s\r\n%s",
-                    client->server_conn->shoutcast_mount, esc_header, refbuf->data+len);
+                    mount, esc_header, refbuf->data+len);
             r->len = strlen (r->data);
             free (esc_header);
             client->respcode = 200;
@@ -1318,6 +1356,33 @@ static int http_client_request (client_t *client)
             if (httpp_parse (client->parser, refbuf->data, refbuf->len))
             {
                 const char *str;
+
+                str = httpp_getvar (client->parser, "x-forwarded-for");
+                if (str)
+                {
+                    if (_find_xforward_addr (config_get_config(), client->connection.ip) != NULL)
+                    {
+                        config_release_config();
+                        int len = strcspn (str, ",") + 1;
+                        int drop_it = 0;
+                        char *ip = malloc (len);
+                        snprintf (ip, len, "%s",  str);
+
+                        if (accept_ip_address (ip) == 0)
+                        {
+                            DEBUG2 ("Dropping client at %s via %s", ip, client->connection.ip);
+                            drop_it = 1;
+                        }
+                        else
+                            DEBUG2 ("x-forwarded-for match for %s, using %s instead", client->connection.ip, ip);
+                        free (client->connection.ip);
+                        client->connection.ip = ip;
+                        if (drop_it)
+                            return -1;
+                    }
+                    else
+                        config_release_config();
+                }
 
                 if (useragents.filename)
                 {
@@ -1620,42 +1685,12 @@ int connection_check_pass (http_parser_t *parser, const char *user, const char *
 }
 
 
-static void _check_for_x_forwarded_for(ice_config_t *config, client_t *client)
-{
-    do {
-        const char *hdr = httpp_getvar (client->parser, "x-forwarded-for");
-        struct xforward_entry *xforward = config->xforward;
-        if (hdr == NULL) break;
-        while (xforward)
-        {
-            if (strcmp (xforward->ip, client->connection.ip) == 0)
-            {
-                int len = strcspn (hdr, ",") + 1;
-                char *ip = malloc (len);
-
-                snprintf (ip, len, "%s",  hdr);
-                free (client->connection.ip);
-                client->connection.ip = ip;
-                DEBUG2 ("x-forward match for %s, using %s instead", xforward->ip, ip);
-                break;
-            }
-            xforward = xforward->next;
-        }
-    } while(0);
-}
-
-
 static int _handle_source_request (client_t *client)
 {
     const char *uri = httpp_getvar (client->parser, HTTPP_VAR_URI);
-    ice_config_t *config = NULL;
 
     INFO1("Source logging in at mountpoint \"%s\"", uri);
 
-    /* use x-forwarded-for ip address if available and authorized */
-    config = config_get_config();
-    _check_for_x_forwarded_for(config, client);
-    config_release_config();
     client->flags &= ~CLIENT_KEEPALIVE;
     
     if (uri[0] != '/')
@@ -1749,7 +1784,6 @@ static int _handle_get_request (client_t *client)
         serverhost = client->server_conn->bind_address;
         serverport = client->server_conn->port;
     }
-    _check_for_x_forwarded_for(config, client);
 
     alias = config->aliases;
 
@@ -1979,7 +2013,7 @@ void connection_reset (connection_t *con, uint64_t time_ms)
 void connection_close(connection_t *con)
 {
 #ifdef HAVE_OPENSSL
-    if (con->ssl) { SSL_shutdown (con->ssl); SSL_free (con->ssl); }
+    if (con->ssl) { if ((con->sslflags & 1) == 0) SSL_shutdown (con->ssl); SSL_free (con->ssl); }
 #endif
     if (con->sock != SOCK_ERROR)
         sock_close (con->sock);

@@ -65,12 +65,17 @@ static void format_mp3_apply_settings (format_plugin_t *format, mount_proxy *mou
 static int  mpeg_process_buffer (client_t *client, format_plugin_t *plugin);
 static void swap_client (client_t *new_client, client_t *old_client);
 static void mpeg_apply_client (format_plugin_t *plugin, client_t *client);
+static void size_up_qblock (source_t *source);
 
 
 /* client format flags */
 #define CLIENT_INTERNAL_FORMAT          (CLIENT_FORMAT_BIT << 4)
 #define CLIENT_IN_METADATA              (CLIENT_INTERNAL_FORMAT)
 #define CLIENT_USING_BLANK_META         (CLIENT_INTERNAL_FORMAT<<1)
+
+#ifndef ICY_DEFAULT_CHARSET
+#define ICY_DEFAULT_CHARSET             "UTF-8"
+#endif
 
 static refbuf_t blank_icy = { 0 , 1, NULL, NULL, "\001StreamTitle='';", 17 };
 static struct metadata_block blank_meta = { 1, 1, &blank_icy, NULL, NULL, NULL };
@@ -394,7 +399,7 @@ static void format_mp3_apply_settings (format_plugin_t *format, mount_proxy *mou
         }
     }
     if (format->charset == NULL)
-        format->charset = strdup ("UTF-8");
+        format->charset = strdup (ICY_DEFAULT_CHARSET);
 
     DEBUG1 ("sending metadata interval %d", source_mp3->interval);
     DEBUG1 ("charset %s", format->charset);
@@ -802,6 +807,7 @@ static int complete_read (source_t *source)
 
     if (source_mp3->read_data == NULL)
     {
+        size_up_qblock (source);
         source_mp3->read_data = refbuf_new (source_mp3->qblock_sz);
         source_mp3->read_count = 0;
     }
@@ -849,6 +855,18 @@ int mpeg_process_buffer (client_t *client, format_plugin_t *plugin)
         unprocessed = mpeg_complete_frames (client_mp3->specific, refbuf, 0);
     }
     return unprocessed;
+}
+
+static void size_up_qblock (source_t *source)
+{
+    mp3_state *source_mp3 = source->format->_state;
+    int multi = 6;
+    if (source->incoming_rate)
+        multi = (source->incoming_rate/100000) + 1;
+    source_mp3->qblock_sz = 1400 * (multi < 17 ? multi : 17);
+
+    // if ((source->buffer_count & 15) == 15)
+        // DEBUG3 ("mount %s, incoming %ld, multi %d", source->mount, source->incoming_rate, source_mp3->qblock_sz);
 }
 
 
@@ -922,12 +940,8 @@ static int validate_mpeg (source_t *source, refbuf_t *refbuf)
             // not reached the metadata block so save and rewind for completing the read
             source_mp3->offset -= unprocessed;
         }
-
-        int multi = 6;
-        if (source->incoming_rate)
-            multi = (source->incoming_rate/140000) + 1;
-        len = source_mp3->qblock_sz = 1400 * (multi < 17 ? multi : 17);
-
+        size_up_qblock (source);
+        len = source_mp3->qblock_sz;
         if (len < unprocessed + 40) // avoid extreme block shrinkage
         {
             WARN3 ("source %s, len %ld, unprocessed %d", source->mount, (long)len, unprocessed);

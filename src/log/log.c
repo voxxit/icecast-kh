@@ -9,7 +9,7 @@
 #include <config.h>
 #endif
 #ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE     1L
+#define _POSIX_C_SOURCE     200112L
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -249,9 +249,11 @@ int log_open(const char *filename)
 /* set the trigger level to trigger, represented in bytes */
 void log_set_trigger(int id, unsigned long trigger)
 {
-    if (id >= 0 && id < LOG_MAXLOGS && loglist [id] . in_use && trigger > 500000)
+    if (id >= 0 && id < LOG_MAXLOGS && loglist [id] . in_use)
     {
-         loglist [id] . trigger_level = trigger;
+        if (trigger < 100000)
+            trigger = 100000;
+        loglist [id] . trigger_level = trigger;
     }
 }
 
