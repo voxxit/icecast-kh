@@ -3,6 +3,7 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
+ * Copyright 2012-2020, Karl Heyes <karl@kheyes.plus.com>
  * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
@@ -34,6 +35,9 @@
 #endif
 #ifdef HAVE_POLL
 #include <poll.h>
+#endif
+#ifdef HAVE_SYS_TYPES_H
+#include <sys/types.h>
 #endif
 #ifdef HAVE_SIGNAL_H
 #include <signal.h>
@@ -195,9 +199,10 @@ static void get_response (int fd, auth_client *auth_user, pid_t pid)
     refbuf_t *r = client->refbuf;
     char *buf = r->data, *blankline;
     unsigned remaining = 4095; /* leave a nul char at least */
-    int ret;
+    int ret = 0;
 
     memset (r->data, 0, remaining+1);
+    sock_set_blocking (fd, 0);
     while (remaining)
     {
 #if HAVE_POLL
@@ -214,9 +219,24 @@ static void get_response (int fd, auth_client *auth_user, pid_t pid)
         }
         if (ret < 0)
             continue;
-#endif
         ret = read (fd, buf, remaining);
-        if (ret <= 0)
+#else
+        if (ret < 0)
+            thread_sleep (20000);
+        ret = read (fd, buf, remaining);
+#endif
+        if (ret < 0)
+        {
+            if (sock_recoverable (sock_error()))
+                continue;
+            remaining = 0;
+        }
+        else
+        {
+            remaining -= ret;
+            buf += ret;
+        }
+        if (buf == r->data)   // if no data at all
             break;
         blankline = strstr (r->data, "\n\n");
         if (blankline)
@@ -230,7 +250,7 @@ static void get_response (int fd, auth_client *auth_user, pid_t pid)
             } while (*p != '\n');
             if (client->flags & CLIENT_HAS_INTRO_CONTENT)
             {
-                r->len = (buf+ret) - (blankline + 2);
+                r->len = buf - (blankline + 2);
                 if (r->len)
                     memmove (r->data, blankline+2, r->len);
                 client->refbuf = refbuf_new (4096);
@@ -239,8 +259,6 @@ static void get_response (int fd, auth_client *auth_user, pid_t pid)
             process_body (fd, pid, auth_user);
             return;
         }
-        buf += ret;
-        remaining -= ret;
     }
     return;
 }
@@ -271,13 +289,21 @@ static auth_result auth_cmd_client (auth_client *auth_user)
     {
         case 0: /* child */
             dup2 (outfd[0], 0);
+            if (outfd[0] != 0)
+                close (outfd[0]);
             dup2 (infd[1], 1);
+            if (infd[1] != 1)
+                close (infd[1]);
             close (outfd[1]);
             close (infd[0]);
+#ifdef _XOPEN_SOURCE
+            if (auth->flags & AUTH_CLEAN_ENV)
+                unsetenv ("LD_PRELOAD");
+#endif
             execl (cmd->listener_add, cmd->listener_add, NULL);
-            ERROR1 ("unable to exec command \"%s\"", cmd->listener_add);
             exit (-1);
         case -1:
+            ERROR1 ("Failed to create child process for %s", cmd->listener_add);
             break;
         default: /* parent */
             close (outfd[0]);
@@ -308,14 +334,34 @@ static auth_result auth_cmd_client (auth_client *auth_user)
             close (outfd[1]);
             get_response (infd[0], auth_user, pid);
             close (infd[0]);
-            DEBUG1 ("Waiting on pid %ld", (long)pid);
-            if (waitpid (pid, &status, 0) < 0)
+            status = -1;
+            do
             {
-                DEBUG1("waitpid error %s", strerror(errno));
-                break;
+                int wstatus = 0;
+                DEBUG1 ("Waiting on pid %ld", (long)pid);
+                if (waitpid (pid, &wstatus, 0) < 0)
+                {
+                    ERROR1("waitpid error %s", strerror(errno));
+                    break;
+                }
+                if (WIFEXITED(wstatus))
+                {
+                    status = WEXITSTATUS(wstatus);  // should be 8 LSB
+                    break;
+                }
+                else if (WIFSIGNALED(wstatus))
+                    break;
+            } while (1);
+
+            if (status == -1)
+            {
+                ERROR1 ("unable to exec command \"%s\"", cmd->listener_add);
+                return AUTH_FAILED;
             }
+
             if (client->flags & CLIENT_AUTHENTICATED)
                 return AUTH_OK;
+            break;
     }
     if (atd->errormsg[0])
     {
@@ -393,6 +439,7 @@ int auth_get_cmd_auth (auth_t *authenticator, config_options_t *options)
     if (state->listener_add == NULL)
     {
         ERROR0 ("No command specified for authentication");
+        free (state);
         return -1;
     }
     authenticator->state = state;

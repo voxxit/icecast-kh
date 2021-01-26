@@ -34,7 +34,7 @@ struct _worker_t
     int count, pending_count;
     int move_allocations;
     spin_t lock;
-    int wakeup_fd[2];
+    FD_t wakeup_fd[2];
 
     client_t *pending_clients;
     client_t **pending_clients_tail,
@@ -93,7 +93,7 @@ struct _client_tag
     listener_t *server_conn;
 
     /* is client getting intro data */
-    long intro_offset;
+    off_t intro_offset;
 
     /* where in the queue the client is */
     refbuf_t *refbuf;
@@ -115,6 +115,7 @@ struct _client_tag
 
     uint64_t timer_start;
     uint64_t counter;
+    uint64_t aux_data;
 
     /* function to call to release format specific resources */
     void (*free_client_data)(struct _client_tag *client);
@@ -126,6 +127,7 @@ struct _client_tag
 
 void client_register (client_t *client);
 void client_destroy(client_t *client);
+int  client_add_cors (client_t *client, char *buf, int remain);
 int  client_send_options(client_t *client);
 int  client_send_501(client_t *client);
 int  client_send_416(client_t *client);
@@ -145,10 +147,14 @@ const char *client_keepalive_header (client_t *client);
 
 int  client_change_worker (client_t *client, worker_t *dest_worker);
 void client_add_worker (client_t *client);
+void client_add_incoming (client_t *client);
 worker_t *worker_selected (void);
 void worker_balance_trigger (time_t now);
 void workers_adjust (int new_count);
 void worker_wakeup (worker_t *worker);
+void worker_logger_init (void);
+void worker_logger (int stop);
+int  is_worker_incoming (worker_t *w);
 
 
 /* client flags bitmask */

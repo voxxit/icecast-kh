@@ -79,6 +79,7 @@ struct master_conn_details
     int previous;
     int ok;
     int max_interval;
+    int run_on;
     time_t synctime;
     char *buffer;
     char *username;
@@ -99,7 +100,7 @@ static int  relay_read (client_t *client);
 static void relay_release (client_t *client);
 
 int slave_running = 0;
-int worker_count;
+extern int worker_count;
 int relays_connecting;
 int streamlister;
 time_t relay_barrier_master;
@@ -180,15 +181,19 @@ relay_server *relay_copy (relay_server *r)
  */
 void slave_update_mounts (void)
 {
+    thread_spin_lock (&relay_start_lock);
     update_settings = 1;
+    thread_spin_unlock (&relay_start_lock);
 }
 
 /* force a recheck of the mounts.
  */
 void slave_update_all_mounts (void)
 {
+    thread_spin_lock (&relay_start_lock);
     update_settings = 1;
     update_all_sources = 1;
+    thread_spin_unlock (&relay_start_lock);
 }
 
 
@@ -197,10 +202,12 @@ void slave_update_all_mounts (void)
  */
 void slave_restart (void)
 {
+    thread_spin_lock (&relay_start_lock);
     restart_connection_thread = 1;
-    slave_update_all_mounts ();
+    update_settings = 1;
     update_all_sources = 1;
     streamlist_check = 0;
+    thread_spin_unlock (&relay_start_lock);
 }
 
 
@@ -247,11 +254,21 @@ void slave_shutdown(void)
 {
     if (slave_running == 0)
         return;
+    DEBUG0 ("shutting down slave");
+    yp_shutdown();
+    stats_shutdown();
+    fserve_shutdown();
+    config_shutdown();
+    stop_logging();
+    // stall until workers have shut down
+    thread_rwlock_wlock (&global.workers_rw);
+    thread_rwlock_unlock (&global.workers_rw);
+
+    //INFO0 ("all workers shut down");
     avl_tree_free (global.relays, NULL);
     thread_rwlock_destroy (&slaves_lock);
     thread_rwlock_destroy (&workers_lock);
     thread_spin_destroy (&relay_start_lock);
-    yp_shutdown();
     slave_running = 0;
 }
 
@@ -354,7 +371,7 @@ static http_parser_t *get_relay_response (connection_t *con, const char *mount,
     memset (response, 0, sizeof(response));
     if (util_read_header (con->sock, response, 4096, READ_ENTIRE_HEADER) == 0)
     {
-        INFO0 ("Header read failure");
+        WARN2 ("Header read failure from %s %s", server, mount);
         return NULL;
     }
     parser = httpp_create_parser();
@@ -737,7 +754,7 @@ static relay_server *create_master_relay (const char *local, const char *remote,
         relay->flags |= RELAY_ON_DEMAND;
     if (master->on_demand) relay->flags |= RELAY_ON_DEMAND;
     relay->interval = master->max_interval;
-    relay->run_on = 30;
+    relay->run_on = master->run_on;
     if (master->send_auth)
     {
         relay->username = (char *)xmlStrdup (XMLSTR(master->username));
@@ -1051,7 +1068,8 @@ static void update_from_master (ice_config_t *config)
     details->bind = (config->master_bind) ? strdup (config->master_bind) : NULL;
     details->on_demand = config->on_demand;
     details->server_id = strdup (config->server_id);
-    details->max_interval = config->master_update_interval;
+    details->max_interval = config->master_relay_retry;
+    details->run_on = config->master_run_on;
     if (config->master_redirect)
     {
         details->args = malloc (4096);
@@ -1134,23 +1152,30 @@ static void _slave_thread(void)
     while (1)
     {
         struct timespec current;
+        int do_reread = 0;
 
         thread_get_timespec (&current);
+
+        global_lock();
+        if (global.running != ICE_RUNNING)
+            break;
         /* re-read xml file if requested */
         if (global . schedule_config_reread)
         {
-            event_config_read ();
             global . schedule_config_reread = 0;
+            do_reread = 1;
         }
 
-        global_add_bitrates (global.out_bitrate, 0L, THREAD_TIME_MS(&current));
         if (global.new_connections_slowdown)
             global.new_connections_slowdown--;
         if (global.new_connections_slowdown > 30)
             global.new_connections_slowdown = 30;
 
-        if (global.running != ICE_RUNNING)
-            break;
+        global_unlock();
+
+        global_add_bitrates (global.out_bitrate, 0L, THREAD_TIME_MS(&current));
+        if (do_reread)
+            event_config_read ();
 
         if (streamlist_check <= current.tv_sec)
         {
@@ -1164,21 +1189,34 @@ static void _slave_thread(void)
             config_release_config();
         }
 
+        int update = 0, update_all = 0, restart = 0;
+        thread_spin_lock (&relay_start_lock);
         if (update_settings)
         {
+            update = update_settings;
+            update_all = update_all_sources;
             if (update_all_sources || current.tv_sec%5 == 0)
             {
-                source_recheck_mounts (update_all_sources);
                 update_settings = 0;
                 update_all_sources = 0;
             }
             if (restart_connection_thread)
             {
-                connection_thread_startup();
+                restart = restart_connection_thread;
                 restart_connection_thread = 0;
             }
         }
-        stats_global_calc();
+        thread_spin_unlock (&relay_start_lock);
+
+        if (update)
+            source_recheck_mounts (update_all);
+        if (restart)
+        {
+            connection_thread_shutdown();
+            connection_thread_startup();
+        }
+
+        stats_global_calc (current.tv_sec);
         fserve_scan (current.tv_sec);
 
         /* allow for terminating icecast if no streams running */
@@ -1206,12 +1244,16 @@ static void _slave_thread(void)
         worker_balance_trigger (current.tv_sec);
         thread_sleep (1000000);
     }
+    global_unlock();
     connection_thread_shutdown();
     fserve_running = 0;
     stats_clients_wakeup ();
     INFO0 ("shutting down current relays");
-    relay_barrier_xml = time(NULL) + 1000;
+    time_t next = time(NULL) + 1000;
+    thread_spin_lock (&relay_start_lock);
+    relay_barrier_xml = next;
     relay_barrier_master = relay_barrier_xml;
+    thread_spin_unlock (&relay_start_lock);
     redirector_clearall();
 
     INFO0 ("Slave thread shutdown complete");
@@ -1346,7 +1388,9 @@ static void redirector_add (const char *server, int port, int interval)
 
 static int relay_expired (relay_server *relay)
 {
+    thread_spin_lock (&relay_start_lock);
     time_t t = (relay->flags & RELAY_FROM_MASTER) ? relay_barrier_master : relay_barrier_xml;
+    thread_spin_unlock (&relay_start_lock);
 
     return (relay->updated < t) ? 1 : 0;
 }
@@ -1622,11 +1666,14 @@ static int relay_startup (client_t *client)
         DEBUG1 ("relay %s disabled", relay->localmount);
         return client->ops->process (client);
     }
+    global_lock();
     if (global.running != ICE_RUNNING)  /* wait for cleanup */
     {
+        global_unlock();
         client->schedule_ms = client->worker->time_ms + 50;
         return 0;
     }
+    global_unlock();
     if (worker->move_allocations)
     {
         int ret = 0;

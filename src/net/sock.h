@@ -48,6 +48,8 @@
 #define sock_t int
 #endif
 
+#define sock_server_t void*
+
 /* The following values are based on unix avoiding errno value clashes */
 #define SOCK_SUCCESS 0
 #define SOCK_ERROR (sock_t)-1
@@ -80,6 +82,7 @@ ssize_t sock_writev (sock_t sock, WSABUF *iov, size_t count);
 # define sock_valid_socket _mangle(sock_valid_socket)
 # define sock_set_blocking _mangle(sock_set_blocking)
 # define sock_set_nolinger _mangle(sock_set_nolinger)
+# define sock_set_cork _mangle(sock_set_cork)
 # define sock_set_nodelay _mangle(sock_set_nodelay)
 # define sock_set_delay _mangle(sock_set_delay)
 # define sock_set_keepalive _mangle(sock_set_keepalive)
@@ -97,6 +100,7 @@ ssize_t sock_writev (sock_t sock, WSABUF *iov, size_t count);
 # define sock_get_server_socket _mangle(sock_get_server_socket)
 # define sock_listen _mangle(sock_listen)
 # define sock_set_send_buffer _mangle(sock_set_send_buffer)
+# define sock_set_mss _mangle(sock_set_mss)
 # define sock_accept _mangle(sock_accept)
 # define sock_create_pipe_emulation _mangle(sock_create_pipe_emulation)
 #endif
@@ -110,15 +114,18 @@ int sock_recoverable(int error);
 int sock_stalled(int error);
 int sock_valid_socket(sock_t sock);
 int sock_active (sock_t sock);
+int sock_peek (sock_t sock, char *arr, int len);
 int sock_set_blocking(sock_t sock, int block);
 int sock_set_nolinger(sock_t sock);
 int sock_set_keepalive(sock_t sock);
 int sock_set_nodelay(sock_t sock);
+int sock_set_cork (sock_t sock, int yes);
+
 void sock_set_send_buffer (sock_t sock, int win_size);
 int sock_set_delay(sock_t sock);
 void sock_set_error(int val);
 int sock_close(sock_t  sock);
-int sock_create_pipe_emulation (int handles[2]);
+void sock_set_mss (sock_t sock, int mss_size);
 
 /* Connection related socket functions */
 sock_t sock_connect_wto(const char *hostname, int port, int timeout);
@@ -140,12 +147,19 @@ int sock_read_line(sock_t sock, char *string, const int len);
 int sock_read_pending(sock_t sock, unsigned timeout);
 
 /* server socket functions */
+sock_server_t sock_get_server_sockets (int port, const char *sinterface);
+int sock_get_next_server_socket (sock_server_t, sock_t *socket);
+void sock_free_server_sockets (sock_server_t);
+
 sock_t sock_get_server_socket(int port, const char *sinterface);
 int sock_listen(sock_t serversock, int backlog);
 sock_t sock_accept(sock_t serversock, char *ip, size_t len);
 
-#ifdef _WIN32
+#ifndef HAVE_INET_ATON
 int inet_aton(const char *s, struct in_addr *a);
+#endif
+#ifdef _WIN32
+int sock_create_pipe_emulation (SOCKET handles[2]);
 #endif
 
 #endif  /* __SOCK_H */

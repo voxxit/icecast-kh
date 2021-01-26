@@ -3,6 +3,9 @@
 /* Define if you have pwd.h */
 #undef CHUID
 
+/* socket type for the rest */
+#undef FD_t
+
 /* Define to 1 if you have the <alloca.h> header file. */
 #undef HAVE_ALLOCA_H
 
@@ -57,6 +60,9 @@
 /* Define to 1 if you have the `fsync' function. */
 #undef HAVE_FSYNC
 
+/* Define to 1 if you have the `ftime' function. */
+#undef HAVE_FTIME
+
 /* Define to 1 if you have the `getaddrinfo' function. */
 #undef HAVE_GETADDRINFO
 
@@ -89,9 +95,6 @@
 
 /* Define if you have libkate */
 #undef HAVE_KATE
-
-/* Define to 1 if you have the <limits.h> header file. */
-#undef HAVE_LIMITS_H
 
 /* Define to 1 if you have the `localtime_r' function. */
 #undef HAVE_LOCALTIME_R
@@ -153,6 +156,9 @@
 /* Define to 1 if you have the <signal.h> header file. */
 #undef HAVE_SIGNAL_H
 
+/* Define to 1 if the system has the type `SOCKET*'. */
+#undef HAVE_SOCKETP
+
 /* Define to 1 if the system has the type `socklen_t'. */
 #undef HAVE_SOCKLEN_T
 
@@ -176,6 +182,9 @@
 
 /* Define to 1 if you have the <string.h> header file. */
 #undef HAVE_STRING_H
+
+/* Define to 1 if you have the `strncasecmp' function. */
+#undef HAVE_STRNCASECMP
 
 /* Define to 1 if you have the `strsep' function. */
 #undef HAVE_STRSEP
@@ -216,9 +225,6 @@
 /* Define if Theora support is available */
 #undef HAVE_THEORA
 
-/* Define to 1 if you have the `time' function. */
-#undef HAVE_TIME
-
 /* Define to 1 if the system has the type `uint32_t'. */
 #undef HAVE_UINT32_T
 
@@ -237,8 +243,10 @@
 /* Define to 1 if you have the `xsltSaveResultToString' function. */
 #undef HAVE_XSLTSAVERESULTTOSTRING
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* "Character set for ICY metadata" */
+#undef ICY_DEFAULT_CHARSET
+
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #undef LT_OBJDIR
 
 /* Name of package */
@@ -291,6 +299,12 @@ typedef int socklen_t;
 /* Number of bits in a file offset, on hosts where this is settable. */
 #undef _FILE_OFFSET_BITS
 
+/* Use GNU setting because of mingw else use standard attribute format setting */
+#ifndef __GNUC__
+#define gnu_printf printf
+#endif
+  
+
 /* Define to include GNU extensions to POSIX */
 #undef _GNU_SOURCE
 
@@ -299,6 +313,12 @@ typedef int socklen_t;
 
 /* Define to use C99 routines on MS */
 #undef _POSIX
+
+/* Define for IPv6 on win32 */
+#undef _WIN32_WINNT
+
+/* Define to empty if __attribute__ is not supported */
+#undef __attribute__
 
 /* Replace __func__ if not supported */
 #undef __func__

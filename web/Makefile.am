@@ -14,4 +14,7 @@ dist_web_DATA = status.xsl \
                 statusbar.html \
                 admin.html \
                 index.html \
-                favicon.ico
+                favicon.ico \
+                error.mp3 \
+                status-json.xsl \
+                xml2json.xslt

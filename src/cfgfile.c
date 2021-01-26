@@ -3,6 +3,7 @@
  * This program is distributed under the GNU General Public License, version 2.
  * A copy of this license is included with this source.
  *
+ * Copyright 2010-2020, Karl Heyes <karl@kheyes.plus.net>
  * Copyright 2000-2004, Jack Moffitt <jack@xiph.org, 
  *                      Michael Smith <msmith@xiph.org>,
  *                      oddsock <oddsock@xiph.org>,
@@ -22,7 +23,7 @@
 #if HAVE_GLOB_H
 #include <glob.h>
 #endif
-
+#include <errno.h>
 #include <fnmatch.h>
 #include "thread/thread.h"
 #include "cfgfile.h"
@@ -30,6 +31,7 @@
 #include "client.h"
 #include "logging.h" 
 #include "global.h"
+#include "git_hash.h"
 
 #define CATMODULE "cfgfile"
 #define CONFIG_DEFAULT_LOCATION "Earth"
@@ -57,7 +59,7 @@
 #define CONFIG_DEFAULT_CHUID 0
 #define CONFIG_MASTER_UPDATE_INTERVAL 120
 #define CONFIG_YP_URL_TIMEOUT 10
-#define CONFIG_DEFAULT_CIPHER_LIST "ECDH+AESGCM:DH+AESGCM:ECDH+AES256:DH+AES256:ECDH+AES128:DH+AES:ECDH+3DES:DH+3DES:RSA+AESGCM:RSA+AES:RSA+3DES:!aNULL:!MD5:!DSS"
+#define CONFIG_DEFAULT_CIPHER_LIST "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256:DHE-DSS-AES128-GCM-SHA256:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-DSS-AES128-SHA256:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:DHE-RSA-AES256-SHA:ECDHE-RSA-DES-CBC3-SHA:ECDHE-ECDSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:AES:DES-CBC3-SHA:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!aECDH:!EDH-DSS-DES-CBC3-SHA:!EDH-RSA-DES-CBC3-SHA:!KRB5-DES-CBC3-SHA"
 
 #ifndef _WIN32
 #define CONFIG_DEFAULT_BASE_DIR "/usr/local/icecast"
@@ -70,6 +72,8 @@
 #define CONFIG_DEFAULT_LOG_DIR ".\\logs"
 #define CONFIG_DEFAULT_WEBROOT_DIR ".\\webroot"
 #define CONFIG_DEFAULT_ADMINROOT_DIR ".\\admin"
+#endif
+#ifndef MIMETYPESFILE
 #define MIMETYPESFILE ".\\mime.types"
 #endif
 
@@ -98,6 +102,51 @@ struct cfg_tag
 };
 
 
+int config_qsizing_conv_a2n (const char *str, uint32_t *p)
+{
+    unsigned int v = 0;
+    char metric = '\0';
+    *p = 0;
+    int r = sscanf ((char*)str, "%u%c", &v, &metric);
+    if (r == 2)
+    {
+        if (metric == 'k')
+            v *= 1000;
+        else if (metric == 'm')
+            v *= 1000000;
+        if (metric == 's')
+        {
+            if (v > 3600)
+                v = 3600;   // cap the seconds to something something like sane
+            *p = 1<<31; // for later conversion, when bitrate is known.
+        }
+    } else if (r != 1) // error converting
+        return 1;
+    if (v > (1<<31))  // enforce cap on largest number
+        v = (unsigned int) (1<<31) - 1;
+    *p += v;
+    return 0;
+}
+
+
+int config_get_qsizing (xmlNodePtr node, void *x)
+{
+    if (xmlIsBlankNode (node) == 0)
+    {
+        char *str = (char *)xmlNodeListGetString (node->doc, node->xmlChildrenNode, 1);
+        if (str == NULL)
+            return 1;
+        uint32_t *p = (unsigned int *)x;
+        if (config_qsizing_conv_a2n (str, p) < 0)
+            return 1;
+
+        errno = 0;
+        xmlFree (str);
+    }
+    return 0;
+}
+
+
 /* Process xml node for boolean value, it may be true, yes, or 1
  */
 int config_get_bool (xmlNodePtr node, void *x)
@@ -114,6 +163,7 @@ int config_get_bool (xmlNodePtr node, void *x)
                 *(int*)x = 1;
             else
                 *(int*)x = (strtol (str, NULL, 0)==0) ? 0 : 1;
+        errno = 0;
         xmlFree (str);
     }
     return 0;
@@ -141,7 +191,23 @@ int config_get_int (xmlNodePtr node, void *x)
         xmlChar *str = xmlNodeListGetString (node->doc, node->xmlChildrenNode, 1);
         if (str == NULL)
             return 1;
-        *(int*)x = strtol ((char*)str, NULL, 0);
+        *(int*)x = (int)strtol ((char*)str, NULL, 0);
+        errno = 0;
+        xmlFree (str);
+    }
+    return 0;
+}
+
+
+int config_get_long (xmlNodePtr node, void *x)
+{
+    if (xmlIsBlankNode (node) == 0)
+    {
+        xmlChar *str = xmlNodeListGetString (node->doc, node->xmlChildrenNode, 1);
+        if (str == NULL)
+            return 1;
+        *(long*)x = strtol ((char*)str, NULL, 0);
+        errno = 0;
         xmlFree (str);
     }
     return 0;
@@ -281,6 +347,13 @@ relay_server *config_clear_relay (relay_server *relay)
 }
 
 
+int config_mount_template (const char *mount)
+{
+    int len = strcspn (mount, "*?[$");
+    return (mount[len]) ? 1 : 0;
+}
+
+
 static void config_clear_mount (mount_proxy *mount)
 {
     config_options_t *option;
@@ -301,6 +374,7 @@ static void config_clear_mount (mount_proxy *mount)
     if (mount->subtype)     xmlFree (mount->subtype);
     if (mount->charset)     xmlFree (mount->charset);
     if (mount->cluster_password) xmlFree (mount->cluster_password);
+    if (mount->redirect)            xmlFree (mount->redirect);
 
     if (mount->auth_type)   xmlFree (mount->auth_type);
     option = mount->auth_options;
@@ -317,12 +391,20 @@ static void config_clear_mount (mount_proxy *mount)
         thread_mutex_lock (&mount->auth->lock);
         auth_release (mount->auth);
     }
+    xmlFree (mount->preroll_log.name);
     if (mount->access_log.logid >= 0)
         log_close (mount->access_log.logid);
     xmlFree (mount->access_log.name);
     xmlFree (mount->access_log.exclude_ext);
     xmlFree (mount->mountname);
     free (mount);
+}
+
+// helper routine for avl/cleanup
+static int config_clear_mount_from_tree (void *arg)
+{
+    config_clear_mount ((mount_proxy *)arg);
+    return 1;
 }
 
 listener_t *config_clear_listener (listener_t *listener)
@@ -364,11 +446,13 @@ void config_clear(ice_config_t *c)
     if (c->webroot_dir) xmlFree(c->webroot_dir);
     if (c->adminroot_dir) xmlFree(c->adminroot_dir);
     if (c->cert_file) xmlFree(c->cert_file);
+    if (c->key_file) xmlFree(c->key_file);
     if (c->cipher_list) xmlFree(c->cipher_list);
     if (c->pidfile) xmlFree(c->pidfile);
     if (c->banfile) xmlFree(c->banfile);
     if (c->allowfile) xmlFree (c->allowfile);
     if (c->agentfile) xmlFree (c->agentfile);
+    if (c->preroll_log.name) xmlFree(c->preroll_log.name);
     if (c->playlist_log.name) xmlFree(c->playlist_log.name);
     if (c->access_log.name) xmlFree(c->access_log.name);
     if (c->error_log.name) xmlFree(c->error_log.name);
@@ -401,6 +485,7 @@ void config_clear(ice_config_t *c)
     while (c->redirect_hosts)
         c->redirect_hosts = config_clear_redirect (c->redirect_hosts);
 
+    avl_tree_free (c->mounts_tree, config_clear_mount_from_tree);
     while (c->mounts)
     {
         mount_proxy *to_go = c->mounts;
@@ -459,13 +544,11 @@ int config_parse_file(const char *filename, ice_config_t *configuration)
     node = xmlDocGetRootElement(doc);
     if (node == NULL) {
         xmlFreeDoc(doc);
-        xmlCleanupParser();
         return CONFIG_ENOROOT;
     }
 
     if (xmlStrcmp(node->name, XMLSTR("icecast")) != 0) {
         xmlFreeDoc(doc);
-        xmlCleanupParser();
         return CONFIG_EBADROOT;
     }
 
@@ -522,8 +605,19 @@ ice_config_t *config_get_config_unlocked(void)
     return &_current_configuration;
 }
 
+
+static int compare_mounts (void *arg, void *a, void *b)
+{
+    mount_proxy *m1 = (mount_proxy *)a;
+    mount_proxy *m2 = (mount_proxy *)b;
+
+    return strcmp (m1->mountname, m2->mountname);
+}
+
+
 static void _set_defaults(ice_config_t *configuration)
 {
+    configuration->gitversion = GIT_VERSION;
     configuration->location = (char *)xmlCharStrdup (CONFIG_DEFAULT_LOCATION);
     configuration->server_id = (char *)xmlCharStrdup (ICECAST_VERSION_STRING);
     configuration->admin = (char *)xmlCharStrdup (CONFIG_DEFAULT_ADMIN);
@@ -551,6 +645,8 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->master_password = NULL;
     configuration->master_bind = NULL;
     configuration->master_relay_auth = 0;
+    configuration->master_relay_retry = configuration->master_update_interval;
+    configuration->master_run_on = 30;
     configuration->base_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_BASE_DIR);
     configuration->log_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_LOG_DIR);
     configuration->webroot_dir = (char *)xmlCharStrdup (CONFIG_DEFAULT_WEBROOT_DIR);
@@ -558,8 +654,12 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->playlist_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_PLAYLIST_LOG);
     configuration->access_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_ACCESS_LOG);
     configuration->access_log.log_ip = 1;
+    configuration->access_log.logid = -1;
     configuration->error_log.name = (char *)xmlCharStrdup (CONFIG_DEFAULT_ERROR_LOG);
     configuration->error_log.level = CONFIG_DEFAULT_LOG_LEVEL;
+    configuration->error_log.logid = -1;
+    configuration->preroll_log.logid = -1;
+    configuration->playlist_log.logid = -1;
     configuration->chroot = CONFIG_DEFAULT_CHROOT;
     configuration->chuid = CONFIG_DEFAULT_CHUID;
     configuration->user = NULL;
@@ -569,8 +669,9 @@ static void _set_defaults(ice_config_t *configuration)
     configuration->relay_username = (char *)xmlCharStrdup (CONFIG_DEFAULT_MASTER_USERNAME);
     configuration->relay_password = NULL;
     /* default to a typical prebuffer size used by clients */
-    configuration->min_queue_size = 0;
+    configuration->min_queue_size = CONFIG_DEFAULT_BURST_SIZE;
     configuration->burst_size = CONFIG_DEFAULT_BURST_SIZE;
+    configuration->mounts_tree = avl_tree_new (compare_mounts, NULL);
 }
 
 
@@ -666,7 +767,7 @@ static int _parse_accesslog (xmlNodePtr node, void *arg)
         { "exclude_ext",    config_get_str,     &log->exclude_ext },
         { "display",        config_get_int,     &log->display },
         { "querystr",       config_get_bool,    &log->qstr },
-        { "size",           config_get_int,     &log->size },
+        { "size",           config_get_long,    &log->size },
         { "duration",       config_get_int,     &log->duration },
         { NULL, NULL, NULL }
     };
@@ -674,6 +775,7 @@ static int _parse_accesslog (xmlNodePtr node, void *arg)
     log->logid = -1;
     log->type = LOG_ACCESS_CLF;
     log->qstr = 1;
+    log->archive = -1;
     if (parse_xml_tags (node, icecast_tags))
         return 2;
     if (type && strcmp (type, "CLF-ESC") == 0)
@@ -692,7 +794,7 @@ static int _parse_errorlog (xmlNodePtr node, void *arg)
         { "archive",        config_get_bool,    &log->archive },
         { "display",        config_get_int,     &log->display },
         { "level",          config_get_int,     &log->level },
-        { "size",           config_get_int,     &log->size },
+        { "size",           config_get_long,    &log->size },
         { "duration",       config_get_int,     &log->duration },
         { NULL, NULL, NULL }
     };
@@ -710,7 +812,7 @@ static int _parse_playlistlog (xmlNodePtr node, void *arg)
         { "name",           config_get_str,     &log->name },
         { "archive",        config_get_bool,    &log->archive },
         { "display",        config_get_int,     &log->display },
-        { "size",           config_get_int,     &log->size },
+        { "size",           config_get_long,    &log->size },
         { "duration",       config_get_int,     &log->duration },
         { NULL, NULL, NULL }
     };
@@ -722,9 +824,11 @@ static int _parse_playlistlog (xmlNodePtr node, void *arg)
 static int _parse_logging (xmlNodePtr node, void *arg)
 {
     ice_config_t *config = arg;
-    int old_trigger_size = -1, old_archive = -1;
+    long old_trigger_size = -1;
+    int old_archive = 1;
     struct cfg_tag icecast_tags[] =
     {
+        { "preroll-log",    _parse_errorlog,    &config->preroll_log },
         { "accesslog",      _parse_accesslog,   &config->access_log },
         { "playlistlog",    _parse_playlistlog, &config->playlist_log },
         { "accesslog",      config_get_str,     &config->access_log.name },
@@ -740,11 +844,14 @@ static int _parse_logging (xmlNodePtr node, void *arg)
         { "playlistlog",    config_get_str,     &config->playlist_log },
         { "playlistlog_lines",
                             config_get_int,     &config->playlist_log.display },
-        { "logsize",        config_get_int,     &old_trigger_size },
+        { "logsize",        config_get_long,    &old_trigger_size },
         { "logarchive",     config_get_bool,    &old_archive },
         { NULL, NULL, NULL }
     };
 
+    config->preroll_log.logid = -1;
+    config->preroll_log.display = 50;
+    config->preroll_log.archive = -1;
     config->access_log.type = LOG_ACCESS_CLF;
     config->access_log.logid = -1;
     config->access_log.display = 100;
@@ -754,26 +861,34 @@ static int _parse_logging (xmlNodePtr node, void *arg)
     config->error_log.archive = -1;
     config->playlist_log.logid = -1;
     config->playlist_log.display = 10;
+    config->playlist_log.archive = -1;
 
     if (parse_xml_tags (node, icecast_tags))
         return -1;
-    if (old_trigger_size > 0)
-    {
-        if (old_trigger_size > 10000000) // have a very large upper value
-            old_trigger_size = 10000000;
-        old_trigger_size <<= 10; // convert to bytes
-        if (config->error_log.size == 0)
-            config->error_log.size = old_trigger_size;
-        if (config->access_log.size == 0)
-            config->access_log.size = old_trigger_size;
-    }
-    if (old_archive > -1)
-    {
-        if (config->error_log.archive == -1)
-            config->error_log.archive = old_archive;
-        if (config->access_log.archive == -1)
-            config->access_log.archive = old_archive;
-    }
+    if (old_trigger_size < 0)
+        old_trigger_size = 20000;   // default
+    if (old_trigger_size > 2000000) // have a very large upper value
+        old_trigger_size = 2000000;
+    old_trigger_size <<= 10; // convert to bytes
+
+    if (config->preroll_log.size == 0)
+        config->preroll_log.size = old_trigger_size;
+    if (config->error_log.size == 0)
+        config->error_log.size = old_trigger_size;
+    if (config->access_log.size == 0)
+        config->access_log.size = old_trigger_size;
+    if (config->playlist_log.size == 0)
+        config->playlist_log.size = old_trigger_size;
+
+    if (config->preroll_log.archive == -1)
+        config->preroll_log.archive = old_archive;
+    if (config->error_log.archive == -1)
+        config->error_log.archive = old_archive;
+    if (config->access_log.archive == -1)
+        config->access_log.archive = old_archive;
+    if (config->playlist_log.archive == -1)
+        config->playlist_log.archive = old_archive;
+
     return 0;
 }
 
@@ -867,9 +982,11 @@ static int _parse_paths (xmlNodePtr node, void *arg)
         { "deny-ip",        config_get_str, &config->banfile },
         { "allow-ip",       config_get_str, &config->allowfile },
         { "deny-agents",    config_get_str, &config->agentfile },
-        { "ssl-certificate",config_get_str, &config->cert_file },
-        { "ssl_certificate",config_get_str, &config->cert_file },
-        { "ssl-allowed-ciphers", config_get_str, &config->cipher_list },
+        { "ssl-private-key",        config_get_str, &config->key_file },
+        { "ssl-certificate",        config_get_str, &config->cert_file },
+        { "ssl-cafile",             config_get_str, &config->ca_file },
+        { "ssl_certificate",        config_get_str, &config->cert_file },
+        { "ssl-allowed-ciphers",    config_get_str, &config->cipher_list },
         { "webroot",        config_get_str, &config->webroot_dir },
         { "adminroot",      config_get_str, &config->adminroot_dir },
         { "alias",          _parse_alias,   config },
@@ -879,6 +996,11 @@ static int _parse_paths (xmlNodePtr node, void *arg)
     config->mimetypes_fn = (char *)xmlCharStrdup (MIMETYPESFILE);
     if (parse_xml_tags (node, icecast_tags))
         return -1;
+    if (config->cert_file)
+    {
+        if (config->key_file == NULL)
+            config->key_file = strdup (config->cert_file);
+    }
     return 0;
 }
 
@@ -916,14 +1038,15 @@ static int _parse_mount (xmlNodePtr node, void *arg)
 {
     ice_config_t *config = arg;
     mount_proxy *mount = calloc(1, sizeof(mount_proxy));
+    char *redirect = NULL;
 
     struct cfg_tag icecast_tags[] =
     {
         { "mount-name",         config_get_str,     &mount->mountname },
         { "source-timeout",     config_get_int,     &mount->source_timeout },
-        { "queue-size",         config_get_int,     &mount->queue_size_limit },
-        { "burst-size",         config_get_int,     &mount->burst_size},
-        { "min-queue-size",     config_get_int,     &mount->min_queue_size},
+        { "queue-size",         config_get_qsizing, &mount->queue_size_limit },
+        { "burst-size",         config_get_qsizing, &mount->burst_size},
+        { "min-queue-size",     config_get_qsizing, &mount->min_queue_size},
         { "username",           config_get_str,     &mount->username },
         { "password",           config_get_str,     &mount->password },
         { "dump-file",          config_get_str,     &mount->dumpfile },
@@ -940,9 +1063,9 @@ static int _parse_mount (xmlNodePtr node, void *arg)
         { "limit-rate",         config_get_bitrate, &mount->limit_rate },
         { "skip-accesslog",     config_get_bool,    &mount->skip_accesslog },
         { "charset",            config_get_str,     &mount->charset },
-        { "qblock-size",        config_get_int,     &mount->queue_block_size },
         { "max-send-size",      config_get_int,     &mount->max_send_size },
-        { "redirect",           config_get_str,     &mount->redirect },
+        { "redirect",           config_get_str,     &redirect },
+        { "redirect-to",        config_get_str,     &mount->redirect },
         { "metadata-interval",  config_get_int,     &mount->mp3_meta_interval },
         { "mp3-metadata-interval",
                                 config_get_int,     &mount->mp3_meta_interval },
@@ -952,6 +1075,7 @@ static int _parse_mount (xmlNodePtr node, void *arg)
                                 config_get_bool,    &mount->url_ogg_meta },
         { "no-mount",           config_get_bool,    &mount->no_mount },
         { "ban-client",         config_get_int,     &mount->ban_client },
+        { "intro-skip-replay",  config_get_int,     &mount->intro_skip_replay },
         { "so-sndbuf",          config_get_int,     &mount->so_sndbuf },
         { "hidden",             config_get_bool,    &mount->hidden },
         { "authentication",     auth_get_authenticator, &mount->auth },
@@ -961,6 +1085,7 @@ static int _parse_mount (xmlNodePtr node, void *arg)
                                 config_get_int,     &mount->max_stream_duration },
         { "max-listener-duration",
                                 config_get_int,     &mount->max_listener_duration },
+        { "preroll-log",        _parse_errorlog,    &mount->preroll_log },
         { "accesslog",          _parse_accesslog,   &mount->access_log },
         /* YP settings */
         { "cluster-password",   config_get_str,     &mount->cluster_password },
@@ -978,8 +1103,9 @@ static int _parse_mount (xmlNodePtr node, void *arg)
     /* default <mount> settings */
     mount->max_listeners = -1;
     mount->max_bandwidth = -1;
-    mount->burst_size = -1;
-    mount->min_queue_size = -1;
+    mount->burst_size = config->burst_size;
+    mount->queue_size_limit = config->queue_size_limit;
+    mount->min_queue_size = config->min_queue_size;;
     mount->mp3_meta_interval = -1;
     mount->yp_public = -1;
     mount->url_ogg_meta = 1;
@@ -989,15 +1115,28 @@ static int _parse_mount (xmlNodePtr node, void *arg)
     mount->access_log.logid = -1;
     mount->access_log.log_ip = 1;
     mount->fallback_override = 1;
-    mount->max_send_size = 1400;
+    mount->max_send_size = 0;
+    mount->preroll_log.logid = -1;
+    mount->preroll_log.display = 50;
+    mount->preroll_log.archive = -1;
 
     if (parse_xml_tags (node, icecast_tags))
         return -1;
-    
+
     if (mount->mountname == NULL)
     {
+        xmlFree (redirect);
         config_clear_mount (mount);
         return -1;
+    }
+    if (redirect)
+    {
+        char patt[] = "/${mount}";
+        int len = strlen (redirect) + strlen (patt) + 1;
+        xmlFree (mount->redirect);
+        mount->redirect = xmlMalloc (len);
+        snprintf (mount->redirect, len, "%s%s", redirect, patt);
+        xmlFree (redirect);
     }
     if (mount->auth)
         mount->auth->mount = strdup (mount->mountname);
@@ -1005,8 +1144,6 @@ static int _parse_mount (xmlNodePtr node, void *arg)
         mount->url_ogg_meta = 1;
     if (mount->url_ogg_meta)
         mount->ogg_passthrough = 0;
-    if (mount->min_queue_size < 0)
-        mount->min_queue_size = mount->burst_size;
     if (mount->ban_client < 0)
         mount->no_mount = 0;
     if (mount->fallback_mount && mount->fallback_mount[0] != '/')
@@ -1016,8 +1153,14 @@ static int _parse_mount (xmlNodePtr node, void *arg)
         mount->fallback_mount = NULL;
     }
 
-    mount->next = config->mounts;
-    config->mounts = mount;
+    if (config_mount_template (mount->mountname))
+    {
+        // may need some priority order imposed at some point
+        mount->next = config->mounts;
+        config->mounts = mount;
+    }
+    else
+        avl_insert (config->mounts_tree, mount);
 
     return 0;
 }
@@ -1093,7 +1236,7 @@ static int _parse_relay (xmlNodePtr node, void *arg)
     };
 
     relay->interval = config->master_update_interval;
-    relay->run_on = 30;
+    relay->run_on = config->master_run_on;
     relay->hosts = host;
     /* default settings */
     host->port = config->port;
@@ -1101,30 +1244,40 @@ static int _parse_relay (xmlNodePtr node, void *arg)
     host->mount = (char*)xmlCharStrdup ("/");
     host->timeout = 4;
 
-    if (parse_xml_tags (node, icecast_tags))
-        return -1;
-
-    if (on_demand)      relay->flags |= RELAY_ON_DEMAND;
-    if (icy_metadata)   relay->flags |= RELAY_ICY_META;
-    if (running)        relay->flags |= RELAY_RUNNING;
-
-    /* check for unspecified entries */
-    if (relay->localmount == NULL)
-        relay->localmount = (char*)xmlCharStrdup (host->mount);
-
-    /* if master is set then remove the default entry at the head of the list */ 
-    if (relay->hosts->next)
+    do
     {
-        relay->hosts = relay->hosts->next;
-        if (host->mount)  xmlFree (host->mount);
-        if (host->ip)     xmlFree (host->ip);
-        if (host->bind)   xmlFree (host->bind);
-        free (host);
-    }
+        if (parse_xml_tags (node, icecast_tags))
+            return -1;
 
-    relay->new_details = config->relays;
-    config->relays = relay;
+        if (on_demand)      relay->flags |= RELAY_ON_DEMAND;
+        if (icy_metadata)   relay->flags |= RELAY_ICY_META;
+        if (running)        relay->flags |= RELAY_RUNNING;
 
+        /* check for unspecified entries */
+        if (relay->localmount == NULL)
+            relay->localmount = (char*)xmlCharStrdup (host->mount);
+        if (relay->localmount[0] != '/')
+        {
+            WARN1 ("relay \"%s\" must begin with /, skipping", relay->localmount);
+            break;
+        }
+
+        /* if master is set then remove the default entry at the head of the list */
+        if (relay->hosts->next)
+        {
+            relay->hosts = relay->hosts->next;
+            if (host->mount)  xmlFree (host->mount);
+            if (host->ip)     xmlFree (host->ip);
+            if (host->bind)   xmlFree (host->bind);
+            free (host);
+        }
+
+        relay->new_details = config->relays;
+        config->relays = relay;
+
+        return 0;
+    } while (0);
+    config_clear_relay (relay);
     return 0;
 }
 
@@ -1165,16 +1318,17 @@ static int _parse_limits (xmlNodePtr node, void *arg)
     struct cfg_tag icecast_tags[] =
     {
         { "max-bandwidth",  config_get_bitrate,&config->max_bandwidth },
-        { "clients",        config_get_int,    &config->client_limit },
-        { "sources",        config_get_int,    &config->source_limit },
-        { "queue-size",     config_get_int,    &config->queue_size_limit },
-        { "min-queue-size", config_get_int,    &config->min_queue_size },
-        { "burst-size",     config_get_int,    &config->burst_size },
-        { "workers",        config_get_int,    &config->workers_count },
-        { "client-timeout", config_get_int,    &config->client_timeout },
-        { "header-timeout", config_get_int,    &config->header_timeout },
-        { "source-timeout", config_get_int,    &config->source_timeout },
-        { "inactivity-timeout", config_get_int,    &config->inactivity_timeout },
+        { "max-listeners",  config_get_int,     &config->max_listeners },
+        { "clients",        config_get_int,     &config->client_limit },
+        { "sources",        config_get_int,     &config->source_limit },
+        { "queue-size",     config_get_qsizing, &config->queue_size_limit },
+        { "min-queue-size", config_get_qsizing, &config->min_queue_size },
+        { "burst-size",     config_get_qsizing, &config->burst_size },
+        { "workers",        config_get_int,     &config->workers_count },
+        { "client-timeout", config_get_int,     &config->client_timeout },
+        { "header-timeout", config_get_int,     &config->header_timeout },
+        { "source-timeout", config_get_int,     &config->source_timeout },
+        { "inactivity-timeout", config_get_int, &config->inactivity_timeout },
         { NULL, NULL, NULL },
     };
     if (parse_xml_tags (node, icecast_tags))
@@ -1198,7 +1352,10 @@ static int _parse_master (xmlNodePtr node, void *arg)
         { "bind",               config_get_str,     &config->master_bind },
         { "interval",           config_get_int,     &config->master_update_interval },
         { "relay-auth",         config_get_bool,    &config->master_relay_auth },
+        { "retry-delay",        config_get_int,     &config->master_relay_retry },
         { "redirect",           config_get_bool,    &config->master_redirect },
+        { "run-on",             config_get_int,     &config->master_run_on },
+        { "on-demand",          config_get_bool,    &config->on_demand },
         { NULL, NULL, NULL },
     };
 
@@ -1206,6 +1363,8 @@ static int _parse_master (xmlNodePtr node, void *arg)
         return -1;
     if (config->master_update_interval < 2)
         config->master_update_interval = 60;
+    if (config->master_relay_retry < 1)
+        config->master_relay_retry = 60;
 
     return 0;
 }
@@ -1223,6 +1382,9 @@ static int _parse_listen_sock (xmlNodePtr node, void *arg)
         { "bind-address",       config_get_str,     &listener->bind_address },
         { "queue-len",          config_get_int,     &listener->qlen },
         { "so-sndbuf",          config_get_int,     &listener->so_sndbuf },
+#ifndef _WIN32
+        { "so-mss",             config_get_int,     &listener->so_mss },
+#endif
         { "ssl",                config_get_bool,    &listener->ssl },
         { "shoutcast-mount",    config_get_str,     &listener->shoutcast_mount },
         { NULL, NULL, NULL },
@@ -1343,21 +1505,31 @@ static int _parse_root (xmlNodePtr node, ice_config_t *config)
 /* return the mount details that match the supplied mountpoint */
 mount_proxy *config_find_mount (ice_config_t *config, const char *mount)
 {
-    mount_proxy *mountinfo = config->mounts, *to_return = NULL;
-
     if (mount == NULL)
     {
         WARN0 ("no mount name provided");
         return NULL;
     }
-    while (mountinfo)
+    void *result;
+    mount_proxy findit, *mountinfo = NULL;
+    findit.mountname = (char *)mount;
+
+    int missing = avl_get_by_key (config->mounts_tree, &findit, &result);
+    if (missing)
     {
-        if (fnmatch (mountinfo->mountname, mount, 0) == 0)
-            to_return = mountinfo;
-        mountinfo = mountinfo->next;
+        mount_proxy *to_return = NULL;
+        mountinfo = config->mounts;
+        while (mountinfo)
+        {
+            if (fnmatch (mountinfo->mountname, mount, 0) == 0)
+                to_return = mountinfo;
+            mountinfo = mountinfo->next;
+        }
+        if (mountinfo == NULL)
+            mountinfo = to_return;
     }
-    if (mountinfo == NULL)
-        mountinfo = to_return;
+    else
+        mountinfo = result;
     return mountinfo;
 }
 

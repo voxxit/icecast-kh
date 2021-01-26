@@ -16,9 +16,11 @@
 
 #include "compat.h"
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 
 #ifndef _WIN32
 #include <sys/time.h>
@@ -32,6 +34,9 @@
 #include <windows.h>
 #include <stdio.h>
 #include <unistd.h>
+#endif
+#ifdef HAVE_FNMATCH_H
+#include <fnmatch.h>
 #endif
 
 #include "net/sock.h"
@@ -58,6 +63,7 @@ struct rate_calc_node
 struct rate_calc
 {
     int64_t total;
+    uint64_t cycle_till;
     struct rate_calc_node *current;
     spin_t lock;
     unsigned int samples;
@@ -122,7 +128,7 @@ int util_read_header(sock_t sock, char *buff, unsigned long len, int entire)
 
         if (util_timed_wait_for_fd(sock, header_timeout*1000) > 0) {
 
-            if ((read_bytes = recv(sock, &c, 1, 0))) {
+            if ((read_bytes = recv(sock, &c, 1, 0)) > 0) {
                 if (c != '\r') buff[pos++] = c;
                 if (entire) {
                     if ((pos > 1) && (buff[pos - 1] == '\n' && 
@@ -204,6 +210,9 @@ static int hex(char c)
 static int verify_path(char *path) {
     int dir = 0, indotseq = 0;
 
+    if (path == NULL || *path == '\0')
+       return 0;  // safety, empty path is invalid
+
     while(*path) {
         if(*path == '/' || *path == '\\') {
             if(indotseq)
@@ -225,7 +234,11 @@ static int verify_path(char *path) {
         dir = 0;
         path++;
     }
-
+#ifdef _WIN32
+    // any path requests ending in '.' on windows are treated as bad
+    if (*(path-1) == '.')
+        return 0;
+#endif
     return 1;
 }
 
@@ -787,18 +800,35 @@ static void rate_purge_entries (struct rate_calc *calc, uint64_t cutoff)
 /* add a value to sampled data, t is used to determine which sample
  * block the sample goes into.
  */
-void rate_add (struct rate_calc *calc, long value, uint64_t sid) 
+void rate_add_sum (struct rate_calc *calc, long value, uint64_t sid, uint64_t *sum)
 {
     uint64_t cutoff;
 
     thread_spin_lock (&calc->lock);
     cutoff = sid - calc->samples;
+    if (calc->cycle_till)
+    {
+        do {
+            if (calc->current)
+            {
+                struct rate_calc_node *next = calc->current->next;
+                if (next->index < calc->cycle_till)
+                {
+                    cutoff = next->index + 1;
+                    break;
+                }
+            }
+            calc->cycle_till = 0;
+        } while (0);
+    }
     if (value == 0 && calc->current && calc->current->value == 0)
     {
         calc->current->index = sid; /* update the timestamp if 0 already present */
         rate_purge_entries (calc, cutoff);
         return;
     }
+    if (sum)
+        *sum += value;
     while (1)
     {
         struct rate_calc_node *next = NULL, *node;
@@ -839,7 +869,13 @@ void rate_add (struct rate_calc *calc, long value, uint64_t sid)
             calc->current = node;
             calc->blocks++;
         }
-        calc->current->value += value;
+        else
+        {
+            calc->current = next;
+            calc->total -= next->value;
+            next->index = sid;
+        }
+        calc->current->value = value;
         break;
     }
     calc->total += value;
@@ -848,9 +884,9 @@ void rate_add (struct rate_calc *calc, long value, uint64_t sid)
 
 
 /* return the average sample value over all the blocks except the 
- * current one, as that may be incomplete
+ * current one, as that may be incomplete. t to reduce the duration
  */
-long rate_avg (struct rate_calc *calc)
+long rate_avg_shorten (struct rate_calc *calc, unsigned int t)
 {
     long total = 0, ssec = 1;
     float range = 1.0;
@@ -860,16 +896,21 @@ long rate_avg (struct rate_calc *calc)
     thread_spin_lock (&calc->lock);
     if (calc && calc->blocks > 1)
     {
-        range = (float)(calc->current->index - calc->current->next->index) + 1;
+        range = (float)(calc->current->index - calc->current->next->index);
         if (range < 1)
             range = 1;
         total = calc->total;
-        ssec = calc->ssec;
+        if (t < calc->ssec)
+            ssec = calc->ssec - t;
     }
     thread_spin_unlock (&calc->lock);
     return (long)(total / range * ssec);
 }
 
+long rate_avg (struct rate_calc *calc)
+{
+    return rate_avg_shorten (calc, 0);
+}
 
 /* reduce the samples used to calculate average */
 void rate_reduce (struct rate_calc *calc, unsigned int range)
@@ -878,7 +919,10 @@ void rate_reduce (struct rate_calc *calc, unsigned int range)
         return;
     thread_spin_lock (&calc->lock);
     if (range && calc->blocks > 1)
+    {
+        calc->cycle_till = calc->current->index;
         rate_purge_entries (calc, calc->current->index - range);
+    }
     else
         thread_spin_unlock (&calc->lock);
 }
@@ -917,6 +961,198 @@ int get_line(FILE *file, char *buf, size_t siz)
     }
     return 0;
 }
+
+
+int cached_pattern_compare (const char *value, const char *pattern)
+{
+#ifdef HAVE_FNMATCH_H
+    int x = fnmatch (pattern, value, FNM_NOESCAPE);
+    switch (x)
+    {
+        case FNM_NOMATCH:
+            break;
+        case 0:
+            return 0;
+        default:
+            INFO0 ("fnmatch failed");
+    }
+    return -1;
+#else
+    return strcmp (pattern, value);
+#endif
+}
+
+
+static int cached_text_compare (void *arg, void *a, void *b)
+{
+    const char *value = (const char *)a;
+    const char *pattern = (const char *)b;
+
+    return strcmp (pattern, value);
+}
+
+
+static void add_generic_text (cache_file_contents *c, const void *in_str, time_t now)
+{
+    char *str = strdup ((const char *)in_str);
+    if (str)
+    {
+#ifdef HAVE_FNMATCH_H
+        if (str [strcspn (str, "*?[")]) // if wildcard present
+        {
+            struct cache_list_node *node = calloc (1, sizeof (*node));
+            node->content = str;
+            node->next = c->extra;
+            c->extra = node;
+            DEBUG1 ("Adding wildcard entry \"%.30s\"", str);
+            return;
+        }
+#endif
+        DEBUG1 ("Adding literal entry \"%.30s\"", str);
+        avl_insert (c->contents, str);
+    }
+}
+
+
+int cached_treenode_free (void*x)
+{
+    free (x);
+    return 1;
+}
+
+
+void cached_prune (cache_file_contents *cache)
+{
+    if (cache == NULL)
+        return;
+    if (cache->contents)
+    {
+        avl_tree_free (cache->contents, cached_treenode_free);
+        cache->contents = NULL;
+    }
+    while (cache->extra)
+    {
+        struct cache_list_node *entry = cache->extra;
+        cache->extra = entry->next;
+        free (entry->content);
+        free (entry);
+    }
+}
+
+
+/* function to handle the re-populating of the avl tree containing IP addresses
+ * for deciding whether a connection of an incoming request is to be dropped.
+ */
+void cached_file_recheck (cache_file_contents *cache, time_t now)
+{
+    struct stat file_stat;
+    FILE *file = NULL;
+    int count = 0;
+    char line [MAX_LINE_LEN];
+
+    if (now < cache->file_recheck)
+       return;      //  common case;
+    do
+    {
+        global_lock();
+        if (now < cache->file_recheck)
+            break; // was racing, updated so get out of here
+
+        cache->file_recheck = now + 10;
+
+        if (cache->filename == NULL)
+        {
+            cached_prune (cache);
+            break;
+        }
+        if (stat (cache->filename, &file_stat) < 0)
+        {
+            WARN2 ("failed to check status of \"%s\": %s", cache->filename, strerror(errno));
+            break;
+        }
+        if (file_stat.st_mtime == cache->file_mtime)
+            break; /* common case when checking, no update to file */
+
+        cache->file_mtime = file_stat.st_mtime;
+
+        file = fopen (cache->filename, "r");
+        if (file == NULL)
+        {
+            WARN2("Failed to open file \"%s\": %s", cache->filename, strerror (errno));
+            break;
+        }
+
+        cached_prune (cache);
+        cache->contents = avl_tree_new (cache->compare, &cache->file_recheck);
+        while (get_line (file, line, MAX_LINE_LEN))
+        {
+            if(!line[0] || line[0] == '#')
+                continue;
+            count++;
+            cache->add( cache, line, 0);
+        }
+        fclose (file);
+        INFO2 ("%d entries read from file \"%s\"", count, cache->filename);
+
+    } while (0);
+    global_unlock();
+}
+
+
+int cached_pattern_search (cache_file_contents *cache, const char *line, time_t now)
+{
+    int ret = -1;
+
+    do
+    {
+        cached_file_recheck (cache, now);
+        if (cache->extra)
+        {
+            struct cache_list_node *entry = cache->extra;
+            while (entry)
+            {
+                if (cached_pattern_compare (line, entry->content) == 0)
+                {
+                    DEBUG1 ("%s matched pattern", line);
+                    return 1;
+                }
+                entry = entry->next;
+            }
+            ret = 0;
+        }
+        if (cache->contents)
+        {
+            void *result;
+
+            if (avl_get_by_key (cache->contents, (char*)line, &result) == 0)
+                return 1;
+            return 0;
+        }
+    } while (0);
+    return ret;
+}
+
+
+void cached_file_clear (cache_file_contents *cache)
+{
+    if (cache == NULL)
+        return;
+    cached_prune (cache);
+    free (cache->filename);
+    memset (cache, 0, sizeof (*cache));
+}
+
+
+void cached_file_init (cache_file_contents *cache, const char *filename, cachefile_add_func add, cachefile_compare_func compare)
+{
+    if (filename == NULL || cache == NULL)
+        return;
+    cache->filename = strdup (filename);
+    cache->file_mtime = 0;
+    cache->add = add ? add : add_generic_text;
+    cache->compare = compare ? compare : cached_text_compare;
+}
+
 
 #ifdef _MSC_VER
 int msvc_snprintf (char *buf, int len, const char *fmt, ...)
@@ -980,7 +1216,9 @@ int util_get_clf_time (char *buffer, unsigned len, time_t now)
     snprintf (timezone_string, sizeof (timezone_string),
             "%%d/%%b/%%Y:%%H:%%M:%%S %c%.2d%.2d", sign, time_tz / 60, time_tz % 60);
 
-    return strftime (buffer, len, timezone_string, &thetime);
+    int r = strftime (buffer, len, timezone_string, &thetime);
+    if (r) errno = 0;
+    return r;
 }
 #else
 
@@ -988,7 +1226,9 @@ int util_get_clf_time (char *buffer, unsigned len, time_t now)
 {
     struct tm thetime;
     localtime_r (&now, &thetime);
-    return strftime (buffer, len, "%d/%b/%Y:%H:%M:%S %z", &thetime);
+    int r = strftime (buffer, len, "%d/%b/%Y:%H:%M:%S %z", &thetime);
+    if (r) errno = 0;
+    return r;
 }
 
 #endif
@@ -1012,12 +1252,13 @@ int util_expand_pattern (const char *mount, const char *pattern, char *buf, unsi
        *len_p = (unsigned int)r;
        return 0;
    }
+   if (len < 1 || len >= max) return -1;
+
    if (len && mount[0] == '/')
    {
       mount++;  // lets skip over the first slash if there is one
       len--;
    }
-   if (len < 1 || len > max) return -1;
 
    mnt = strdup (mount);
    while (i < max)

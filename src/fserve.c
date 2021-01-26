@@ -102,7 +102,8 @@ typedef struct {
     icefile_handle f;
     time_t stats_update;
     time_t expire;
-    long stats;
+    long frame_start_pos;
+    stats_handle_t stats;
     format_plugin_t *format;
     struct rate_calc *out_bitrate;
     avl_tree *clients;
@@ -122,6 +123,8 @@ static fh_node no_file;
 
 void fserve_initialize(void)
 {
+    if (fserve_running) return;
+
     ice_config_t *config = config_get_config();
 
     mimetypes = NULL;
@@ -243,7 +246,8 @@ static int _delete_fh (void *mapping)
         format_plugin_clear (fh->format, NULL);
         free (fh->format);
     }
-    avl_tree_free (fh->clients, NULL);
+    if (fh->clients)
+        avl_tree_free (fh->clients, NULL);
     rate_free (fh->out_bitrate);
     free (fh->finfo.mount);
     free (fh->finfo.fallback);
@@ -265,27 +269,28 @@ static void remove_from_fh (fh_node *fh, client_t *client)
 {
     thread_mutex_lock (&fh->lock);
     fh->refcount--;
-    avl_delete (fh->clients, client, NULL);
-    if ((fh->refcount != fh->clients->length && fh->finfo.mount) || ((fh->refcount != fh->clients->length+1) && fh->finfo.mount == NULL))
-        ERROR3 (" on %s, with ref %d, len %d", fh->finfo.mount, fh->refcount, fh->clients->length);
+    if (fh->clients)
+    {
+        avl_delete (fh->clients, client, NULL);
+        if ((fh->refcount != fh->clients->length && fh->finfo.mount) || ((fh->refcount != fh->clients->length+1) && fh->finfo.mount == NULL))
+            ERROR3 (" on %s, with ref %d, len %d", fh->finfo.mount, fh->refcount, fh->clients->length);
+    }
     if (fh->refcount == 0 && fh->finfo.mount)
     {
         rate_free (fh->out_bitrate);
-        fh->out_bitrate = rate_setup (10000, 1000);
         if ((fh->finfo.flags & FS_FALLBACK) == 0)
         {
+            fh->out_bitrate = NULL;
             if (fh->finfo.flags & FS_DELETE)
             {
                 thread_mutex_unlock (&fh->lock);
                 _delete_fh (fh);
                 return;
             }
-            else
-            {
-                DEBUG1 ("setting timeout as no clients on %s", fh->finfo.mount);
-                fh->expire = time(NULL) + 10;
-            }
+            DEBUG1 ("setting timeout as no clients on %s", fh->finfo.mount);
+            fh->expire = time(NULL) + 10;
         }
+        fh->out_bitrate = rate_setup (10000, 1000);
     }
     thread_mutex_unlock (&fh->lock);
 }
@@ -320,6 +325,8 @@ static fh_node *find_fh (fbinfo *finfo)
 
 static void fh_add_client (fh_node *fh, client_t *client)
 {
+    if (fh->clients == NULL)
+        return;
     avl_insert (fh->clients, client);
     fh->refcount++;
     if ((fh->refcount != fh->clients->length && fh->finfo.mount) || ((fh->refcount != fh->clients->length+1) && fh->finfo.mount == NULL))
@@ -403,9 +410,24 @@ static fh_node *open_fh (fbinfo *finfo)
             if (format_get_plugin (fh->format) < 0)
             {
                 avl_tree_unlock (fh_cache);
+                file_close (&fh->f);
                 free (fh->format);
                 free (fh);
                 return NULL;
+            }
+            format_check_t fcheck;
+            fcheck.fd = fh->f;
+            fcheck.desc = finfo->mount;
+            if (format_check_frames (&fcheck) < 0 || fcheck.type == FORMAT_TYPE_UNDEFINED)
+                WARN1 ("different type detected for %s", finfo->mount);
+            else
+            {
+                if (fh->finfo.limit && fcheck.bitrate > 0)
+                {
+                    float ratio = (float)fh->finfo.limit / (fcheck.bitrate/8);
+                    if (ratio < 0.9 || ratio > 1.1)
+                        WARN3 ("bitrate from %s (%d), was expecting %d", finfo->mount, (fcheck.bitrate/1000), (fh->finfo.limit/1000*8));
+                }
             }
         }
         if (fh->finfo.limit)
@@ -478,7 +500,7 @@ int fserve_client_create (client_t *httpclient, const char *path)
                     *at = "", *user = "", *pass ="";
         char *sourceuri = strdup (path);
         char *dot = strrchr (sourceuri, '.');
-        char *protocol = "http";
+        char *protocol = not_ssl_connection (&httpclient->connection) ? "http" : "https";
         const char *agent = httpp_getvar (httpclient->parser, "user-agent");
         int x;
         char scratch[1000];
@@ -586,8 +608,13 @@ static void file_release (client_t *client)
     fh_node *fh = client->shared_data;
     int ret = -1;
 
-    if (fh->finfo.limit)
-        stats_event_dec (NULL, "listeners");
+    if ((fh->finfo.flags & FS_FALLBACK) && (client->flags & CLIENT_AUTHENTICATED))
+    {
+        // reduce from global count
+        global_lock();
+        global.listeners--;
+        global_unlock();
+    }
 
     client_set_queue (client, NULL);
 
@@ -597,6 +624,8 @@ static void file_release (client_t *client)
 
         if (fh->finfo.flags & FS_FALLBACK)
             m = httpp_getvar (client->parser, HTTPP_VAR_URI);
+        else if (client->mount)
+            m = client->mount;
         else
             m = fh->finfo.mount;
         if (m)
@@ -606,6 +635,7 @@ static void file_release (client_t *client)
             mount_proxy *mountinfo;
 
             remove_from_fh (fh, client);
+            client->shared_data = NULL;
             config = config_get_config ();
             mountinfo = config_find_mount (config, mount);
             if (mountinfo && mountinfo->access_log.name)
@@ -621,6 +651,7 @@ static void file_release (client_t *client)
         remove_from_fh (fh, client);
     if (ret < 0)
     {
+        client->shared_data = NULL;
         client->flags &= ~CLIENT_AUTHENTICATED;
         client_destroy (client);
     }
@@ -677,14 +708,14 @@ static int fserve_change_worker (client_t *client)
     worker_t *this_worker = client->worker, *worker;
     int ret = 0;
 
-    if (this_worker->move_allocations == 0 || worker_count < 2)
+    if (this_worker->move_allocations == 0)
         return 0;
     thread_rwlock_rlock (&workers_lock);
     worker = worker_selected ();
     if (worker && worker != client->worker)
     {
-        long diff = this_worker->count - worker->count;
-        if (diff > 15)
+        long diff = this_worker->move_allocations < 1000000 ? this_worker->count - worker->count : 1000;
+        if (diff > 10)
         {
             this_worker->move_allocations--;
             ret = client_change_worker (client, worker);
@@ -713,18 +744,21 @@ static int prefile_send (client_t *client)
             return -1;
         if (refbuf == NULL || client->pos == refbuf->len)
         {
-            if ((client->flags & CLIENT_AUTHENTICATED) == 0)
-                return -1;
-            if (fh->finfo.fallback)
+            if (fh->finfo.fallback && (client->flags & CLIENT_AUTHENTICATED))
                 return fserve_move_listener (client);
 
             if (refbuf == NULL || refbuf->next == NULL)
             {
+                if ((client->flags & CLIENT_AUTHENTICATED) == 0)
+                    return -1;
                 if (file_in_use (fh->f)) // is there a file to read from
                 {
+                    if (fh->format->detach_queue_block)
+                        fh->format->detach_queue_block (NULL, client->refbuf);
                     refbuf_release (client->refbuf);
                     client->refbuf = NULL;
                     client->pos = 0;
+                    client->intro_offset = fh->frame_start_pos;
                     if (fh->finfo.limit)
                     {
                         client->ops = &throttled_file_content_ops;
@@ -743,6 +777,8 @@ static int prefile_send (client_t *client)
                 refbuf_t *to_go = client->refbuf;
                 refbuf = client->refbuf = to_go->next;
                 to_go->next = NULL;
+                if (fh->format && fh->format->detach_queue_block)
+                    fh->format->detach_queue_block (NULL, client->refbuf);
                 refbuf_release (to_go);
             }
             client->pos = 0;
@@ -773,9 +809,10 @@ static int file_send (client_t *client)
     worker_t *worker = client->worker;
     time_t now;
 
+#if 0
     if (fserve_change_worker (client)) // allow for balancing
         return 1;
-
+#endif
     client->schedule_ms = worker->time_ms;
     now = worker->current_time.tv_sec;
     /* slowdown if max bandwidth is exceeded, but allow for short-lived connections to avoid 
@@ -936,12 +973,22 @@ int fserve_setup_client_fb (client_t *client, fbinfo *finfo)
             if (client->connection.sent_bytes == 0)
                 client->timer_start -= 2;
             client->counter = 0;
-            client->intro_offset = 0;
             global_reduce_bitrate_sampling (global.out_bitrate);
         }
     }
     else
+    {
+        if (client->mount && (client->flags & CLIENT_AUTHENTICATED) && (client->respcode >= 300 || client->respcode < 200))
+        {
+            fh = calloc (1, sizeof (no_file));
+            fh->finfo.mount = strdup (client->mount);
+            fh->finfo.flags |= FS_DELETE;
+            fh->refcount = 1;
+            fh->f = SOCK_ERROR;
+            thread_mutex_create (&fh->lock);
+        }
         thread_mutex_lock (&fh->lock);
+    }
     client->mount = fh->finfo.mount;
     if (fh->finfo.type == FORMAT_TYPE_UNDEFINED)
     {
@@ -961,6 +1008,7 @@ int fserve_setup_client_fb (client_t *client, fbinfo *finfo)
     if (ret < 0)
     {
         thread_mutex_unlock (&fh->lock);
+        client->mount = NULL;
         return client_send_416 (client);
     }
     fh_add_client (fh, client);
@@ -983,10 +1031,11 @@ int fserve_setup_client_fb (client_t *client, fbinfo *finfo)
     else
     {
         worker_t *worker = client->worker;
+        ret = (fh->finfo.limit) ? 0 : -1;
         client->flags |= CLIENT_ACTIVE;
         worker_wakeup (worker); /* worker may of already processed client but make sure */
     }
-    return (fh->finfo.limit) ? 0 : -1;
+    return ret;
 }
 
 
@@ -1032,7 +1081,7 @@ int fserve_set_override (const char *mount, const char *dest, format_type_t type
             result->finfo.flags &= ~FS_FALLBACK;
             result->format = NULL;
             result->stats = 0;
-            result->f = -1;
+            result->f = SOCK_ERROR;
             result->finfo.fallback = strdup (dest);
             result->finfo.type = type;
         }
@@ -1105,6 +1154,7 @@ void fserve_recheck_mime_types (ice_config_t *config)
         { "pls",            "audio/x-scpls" },
         { "xspf",           "application/xspf+xml" },
         { "ogg",            "application/ogg" },
+        { "xml",            "text/xml" },
         { "mp3",            "audio/mpeg" },
         { "aac",            "audio/aac" },
         { "aacp",           "audio/aacp" },
@@ -1395,6 +1445,12 @@ ssize_t pread (icefile_handle f, void *data, size_t count, off_t offset)
 void fserve_scan (time_t now)
 {
     avl_node *node;
+
+    global_lock();
+    if (global.running != ICE_RUNNING)
+        now = (time_t)0;
+    global_unlock();
+
     avl_tree_wlock (fh_cache);
     node = avl_get_first (fh_cache);
     while (node)
@@ -1403,8 +1459,7 @@ void fserve_scan (time_t now)
         node = avl_get_next (node);
 
         thread_mutex_lock (&fh->lock);
-        if (global.running != ICE_RUNNING)
-            fh->expire = 0;
+
         if (now == (time_t)0)
         {
             fh->expire = 0;
@@ -1419,7 +1474,7 @@ void fserve_scan (time_t now)
             {
                 int len = strlen (finfo->mount) + 10;
                 char *str = alloca (len);
-                char buf[20];
+                char buf[30];
                 snprintf (str, len, "%s-%s", (finfo->flags & FS_FALLBACK) ? "fallback" : "file", finfo->mount);
                 fh->stats = stats_handle (str);
                 stats_set_flags (fh->stats, "fallback", "file", STATS_COUNTERS|STATS_HIDDEN);

@@ -106,6 +106,7 @@ avl_tree_free_helper (avl_node * node, avl_free_key_fun_type free_key_fun)
 void
 avl_tree_free (avl_tree * tree, avl_free_key_fun_type free_key_fun)
 {
+  if (tree == NULL) return;
   if (tree->length && tree->root->right) {
     avl_tree_free_helper (tree->root->right, free_key_fun);
   }
@@ -1037,7 +1038,7 @@ avl_verify_rank (avl_node * node)
       num_right = avl_verify_rank (node->right);
     }
     if (AVL_GET_RANK (node) != num_left + 1) {
-      fprintf (stderr, "invalid rank at node %ld\n", (long) node->key);
+      fprintf (stderr, "invalid rank at node %p\n", node->key);
       exit (1);
     }
     return (num_left + num_right + 1);

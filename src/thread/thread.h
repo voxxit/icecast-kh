@@ -116,6 +116,11 @@ typedef mutex_t spin_t;
 #define thread_spin_unlock(x)    thread_mutex_unlock(x)
 #endif
 
+typedef int (*thread_mx_create_func)(void**m, int create);
+typedef int (*thread_mx_lock_func)(void**m, int create);
+
+int thread_mtx_create_callback(void**m, int create);
+int thread_mtx_lock_callback(void**m, int lock);
 
 #define thread_create(n,x,y,z) thread_create_c(n,x,y,z,__LINE__,__FILE__)
 #define thread_mutex_create(x) thread_mutex_create_c(x,__LINE__,__FILE__)
@@ -131,6 +136,7 @@ typedef mutex_t spin_t;
 #define thread_rwlock_rlock(x) thread_rwlock_rlock_c(x,__LINE__,__FILE__)
 #define thread_rwlock_tryrlock(x) thread_rwlock_tryrlock_c(x,__LINE__,__FILE__)
 #define thread_rwlock_wlock(x) thread_rwlock_wlock_c(x,__LINE__,__FILE__)
+#define thread_rwlock_trywlock(x) thread_rwlock_trywlock_c(x,__LINE__,__FILE__)
 #define thread_rwlock_unlock(x) thread_rwlock_unlock_c(x,__LINE__,__FILE__)
 #define thread_exit(x) thread_exit_c(x,__LINE__,__FILE__)
 
@@ -178,8 +184,8 @@ void thread_use_log_id(int log_id);
 thread_type *thread_create_c(char *name, void *(*start_routine)(void *), 
         void *arg, int detached, int line, const char *file);
 void thread_mutex_create_c(mutex_t *mutex, int line, const char *file);
-void thread_mutex_lock_c(mutex_t *mutex, int line, char *file);
-void thread_mutex_unlock_c(mutex_t *mutex, int line, char *file);
+void thread_mutex_lock_c(mutex_t *mutex, int line, const char *file);
+void thread_mutex_unlock_c(mutex_t *mutex, int line, const char *file);
 void thread_mutex_destroy_c (mutex_t *mutex, int line, const char *file);
 void thread_cond_create_c(cond_t *cond, int line, char *file);
 void thread_cond_signal_c(cond_t *cond, int line, char *file);
@@ -191,6 +197,7 @@ void thread_rwlock_create_c(const char *name, rwlock_t *rwlock, int line, const 
 void thread_rwlock_rlock_c(rwlock_t *rwlock, int line, const char *file);
 int  thread_rwlock_tryrlock_c(rwlock_t *rwlock, int line, const char *file);
 void thread_rwlock_wlock_c(rwlock_t *rwlock, int line, const char *file);
+int  thread_rwlock_trywlock_c(rwlock_t *rwlock, int line, const char *file);
 void thread_rwlock_unlock_c(rwlock_t *rwlock, int line, const char *file);
 void thread_rwlock_destroy(rwlock_t *rwlock);
 void thread_exit_c(long val, int line, char *file);

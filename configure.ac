@@ -1,20 +1,23 @@
-AC_INIT([Icecast], [2.4.0-kh1], [karl@kheyes.plus.com])
+dnl Process this file with autoconf to produce a configure script.
+AC_INIT([Icecast], [2.4.0-kh15-ac1], [karl@kheyes.plus.com])
+AC_CONFIG_AUX_DIR([build-aux])
+AM_INIT_AUTOMAKE([foreign])
+
+AC_PREREQ(2.59)
+AC_CONFIG_SRCDIR([src/main.c])
+AM_CONFIG_HEADER(config.h)
+AC_CONFIG_MACRO_DIR([m4])
+
+AM_MAINTAINER_MODE
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 LT_INIT
-AC_PREREQ(2.59)
-AC_CONFIG_SRCDIR(src/main.c)
-dnl Process this file with autoconf to produce a configure script.
-
-AM_INIT_AUTOMAKE
-AM_CONFIG_HEADER(config.h)
-AM_MAINTAINER_MODE
-AC_CONFIG_MACRO_DIR([m4])
 
 AC_PROG_CXX
 AC_PROG_CC
 AC_CANONICAL_HOST
-AC_PROG_LIBTOOL
 AC_SYS_LARGEFILE
+XIPH_C_ATTRIBUTE
 
 dnl Set some options based on environment
 
@@ -32,6 +35,11 @@ if test x$host_os = xmingw32; then
 AC_DEFINE([_POSIX], 1, [Define to use C99 routines on MS])
 fi
 
+AC_ARG_VAR([ICY_CHARSET], [Character set used for ICY metadata, default is UTF8])
+if test -n "$ICY_CHARSET"; then
+   AC_DEFINE_UNQUOTED([ICY_DEFAULT_CHARSET], ["$ICY_CHARSET"], ["Character set for ICY metadata"])
+fi
+
 dnl Checks for programs.
 
 dnl Checks for libraries.
@@ -40,7 +48,7 @@ dnl Checks for header files.
 AC_HEADER_STDC
 AC_HEADER_TIME
 
-AC_CHECK_HEADERS([fcntl.h signal.h fnmatch.h limits.h sys/timeb.h sys/wait.h alloca.h malloc.h glob.h winsock2.h windows.h stdbool.h])
+AC_CHECK_HEADERS([fcntl.h fnmatch.h sys/timeb.h sys/wait.h alloca.h malloc.h glob.h winsock2.h windows.h stdbool.h signal.h])
 AC_CHECK_HEADERS(pwd.h, AC_DEFINE(CHUID, 1, [Define if you have pwd.h]),,)
 
 dnl Checks for typedefs, structures, and compiler characteristics.
@@ -52,14 +60,19 @@ AC_CHECK_TYPES([struct timespec])
 
 dnl Checks for library functions.
 AC_CHECK_FUNCS([localtime_r gmtime_r FindFirstFile])
-AC_CHECK_FUNCS([fseeko fnmatch chroot fork poll atoll strtoll strsep strcasecmp])
-AC_CHECK_FUNCS([getrlimit gettimeofday time fsync glob pread pipe2 setresuid setresgid])
+AC_CHECK_FUNCS([fseeko fnmatch chroot fork poll atoll strtoll strsep strcasecmp strncasecmp])
+AC_CHECK_FUNCS([getrlimit gettimeofday ftime fsync glob pread pipe2 setresuid setresgid])
 AC_CHECK_TYPES([struct signalfd_siginfo],
                [AC_DEFINE(HAVE_SIGNALFD, 1 ,[Define if signalfd exists])], [],
                [#include <sys/signalfd.h>])
 AC_CHECK_TYPES([uint32_t], [], [], [
 #include <inttypes.h>
 #include <stdint.h>
+])
+AC_CHECK_TYPES([SOCKET*],
+        [AC_DEFINE([FD_t], [SOCKET], [socket type for Windows])],
+        [AC_DEFINE([FD_t], [int], [socket type for the rest])], [
+#include <winsock2.h>
 ])
 if test "x$ac_cv_func_fnmatch" != "xyes" 
 then
@@ -139,7 +152,7 @@ XIPH_PATH_CURL([
     ])
 dnl -- YP support --
 AC_ARG_ENABLE([yp],
-        AC_HELP_STRING([--disable-yp],[disable YP directory support]),
+        AS_HELP_STRING([--disable-yp],[disable YP directory support]),
         enable_yp="$enableval",
         enable_yp="yes")
 if test "x$enable_yp" = "xyes" -a "x$enable_curl" = xyes
@@ -180,7 +193,20 @@ AC_SUBST(ICECAST_OPTIONAL)
 AC_SUBST(HAVE_KATE)
 AC_SUBST(KATE_LIBS)
 
-AC_OUTPUT([Makefile conf/Makefile src/Makefile src/avl/Makefile
-src/httpp/Makefile src/thread/Makefile src/log/Makefile
-src/net/Makefile src/timing/Makefile doc/Makefile web/Makefile web/images/Makefile
-admin/Makefile win32/Makefile win32/res/Makefile])
+AC_CONFIG_FILES([
+   Makefile
+   conf/Makefile
+   src/Makefile
+   src/avl/Makefile
+   src/httpp/Makefile
+   src/thread/Makefile
+   src/log/Makefile
+   src/net/Makefile
+   src/timing/Makefile
+   doc/Makefile
+   web/Makefile
+   web/images/Makefile
+   admin/Makefile
+   win32/Makefile
+])
+AC_OUTPUT

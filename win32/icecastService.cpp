@@ -1,9 +1,9 @@
+#include <config.h>
 #include <winsock2.h>
 #include <stdio.h>
 #include <direct.h>
 
 extern "C" {
-#include <config.h>
 #include "thread/thread.h"
 #include "avl/avl.h"
 #include "log/log.h"
@@ -14,6 +14,7 @@ extern "C" {
 #include "refbuf.h"
 #include "client.h"
 #include "stats.h"
+#include "fserve.h"
 }
 
 // Issues to be wary of. Careful of the runtime you use, I've had printf and similar routines
@@ -43,20 +44,20 @@ void installService (const char *path)
 			return;
 		}
 
-		SC_HANDLE service = CreateService(
-			manager,
-			PACKAGE_STRING,
-			PACKAGE_STRING " Streaming Media Server",
-			GENERIC_READ | GENERIC_EXECUTE,
-			SERVICE_WIN32_OWN_PROCESS,
-			SERVICE_AUTO_START,
-			SERVICE_ERROR_IGNORE,
-			fullPath,
-			NULL,
-			NULL,
-			NULL,
-			NULL,
-			NULL
+        SC_HANDLE service = CreateService(
+                manager,
+                PACKAGE_NAME,
+                PACKAGE_NAME " Streaming Media Server",
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_IGNORE,
+                fullPath,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL
 		);
 		if (service == NULL)
 		{
@@ -64,6 +65,18 @@ void installService (const char *path)
 			CloseServiceHandle (manager);
 			return;
 		}
+
+        SERVICE_DESCRIPTION sd;
+
+        sd.lpDescription = (char*)"Provides streaming media services";
+
+        if (ChangeServiceConfig2(
+                    service,                        // handle to service
+                    SERVICE_CONFIG_DESCRIPTION,     // change: description
+                    &sd) == FALSE)                  // new description
+        {
+            printf("ChangeServiceConfig2 failed\n");
+        }
 
 		printf ("Service Installed\n");
 		CloseServiceHandle (service);
@@ -79,7 +92,7 @@ void removeService()
 		return;
 	}
 
-	SC_HANDLE service = OpenService (manager, PACKAGE_STRING, DELETE);
+	SC_HANDLE service = OpenService (manager, PACKAGE_NAME, DELETE);
 	if (service) {
 		DeleteService(service);
         CloseServiceHandle (service);
@@ -113,6 +126,7 @@ static int run_server (int argc, char *argv[])
     int		ret;
 
     initialize_subsystems();
+    fserve_initialize();
 
     ret = server_init (argc, argv);
     if (ret == 0)

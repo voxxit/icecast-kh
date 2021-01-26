@@ -49,7 +49,7 @@
 #define atoll(nptr) strtoll(nptr, (char **)NULL, 10)
 #endif
 
-#define VAL_BUFSIZE 20
+#define VAL_BUFSIZE 30
 #define STATS_BLOCK_CONNECTION  01
 
 #define STATS_EVENT_SET     0
@@ -64,6 +64,7 @@ typedef struct _stats_node_tag
 {
     char *name;
     char *value;
+    time_t  last_reported;
     int  flags;
 } stats_node_t;
 
@@ -161,23 +162,23 @@ void stats_initialize(void)
     stats_event_time (NULL, "server_start", STATS_GENERAL);
 
     /* global currently active stats */
-    stats_event_flags (NULL, "clients", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "sources", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "stats", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "banned_IPs", "0", STATS_COUNTERS);
-    stats_event (NULL, "listeners", "0");
+    stats_event_flags (NULL, "clients", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "listeners", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "sources", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "stats", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "banned_IPs", "0", STATS_COUNTERS|STATS_REGULAR);
 #ifdef GIT_VERSION
     stats_event (NULL, "build", GIT_VERSION);
 #endif
 
     /* global accumulating stats */
-    stats_event_flags (NULL, "client_connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "source_client_connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "source_relay_connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "source_total_connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "stats_connections", "0", STATS_COUNTERS);
-    stats_event_flags (NULL, "listener_connections", "0", STATS_COUNTERS);
+    stats_event_flags (NULL, "client_connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "source_client_connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "source_relay_connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "source_total_connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "stats_connections", "0", STATS_COUNTERS|STATS_REGULAR);
+    stats_event_flags (NULL, "listener_connections", "0", STATS_COUNTERS|STATS_REGULAR);
     stats_event_flags (NULL, "outgoing_kbitrate", "0", STATS_COUNTERS|STATS_REGULAR);
     stats_event_flags (NULL, "stream_kbytes_sent", "0", STATS_COUNTERS|STATS_REGULAR);
     stats_event_flags (NULL, "stream_kbytes_read", "0", STATS_COUNTERS|STATS_REGULAR);
@@ -328,7 +329,7 @@ char *stats_get_value(const char *source, const char *name)
 }
 
 
-char *stats_retrieve (long handle, const char *name)
+char *stats_retrieve (stats_handle_t handle, const char *name)
 {
     char *v = NULL;
     stats_source_t *src_stats = (stats_source_t *)handle;
@@ -455,7 +456,15 @@ static void modify_node_event (stats_node_t *node, stats_event_t *event)
         if (event->value == NULL)
             return;
     }
-    if (event->action != STATS_EVENT_SET)
+    if (event->action == STATS_EVENT_SET)
+    {
+        if (node->flags & STATS_REGULAR)
+        {
+            if (node->value && strcmp (node->value, event->value) == 0)
+                return;  // no change, lets get out
+        }
+    }
+    else
     {
         int64_t value = 0;
 
@@ -479,11 +488,13 @@ static void modify_node_event (stats_node_t *node, stats_event_t *event)
         snprintf (event->value, VAL_BUFSIZE, "%" PRId64, value);
     }
     if (node->value)
-    {
         free (node->value);
-        node->value = strdup (event->value);
-    }
-    DEBUG3 ("update \"%s\" %s (%s)", event->source?event->source:"global", node->name, node->value);
+    node->value = strdup (event->value);
+
+    if (node->flags & STATS_REGULAR)
+        node->last_reported = 0;
+    else
+        DEBUG3 ("update \"%s\" %s (%s)", event->source?event->source:"global", node->name, node->value);
 }
 
 
@@ -509,8 +520,6 @@ static void process_global_event (stats_event_t *event)
     if (node)
     {
         modify_node_event (node, event);
-        if ((node->flags & STATS_REGULAR) == 0)
-            stats_listener_send (node->flags, "EVENT global %s %s\n", node->name, node->value);
     }
     else
     {
@@ -521,8 +530,9 @@ static void process_global_event (stats_event_t *event)
         node->flags = event->flags;
 
         avl_insert(_stats.global_tree, (void *)node);
-        stats_listener_send (node->flags, "EVENT global %s %s\n", event->name, event->value);
     }
+    if ((node->flags & STATS_REGULAR) == 0)
+        stats_listener_send (node->flags, "EVENT global %s %s\n", node->name, node->value);
     avl_tree_unlock (_stats.global_tree);
 }
 
@@ -650,7 +660,7 @@ static void process_source_event (stats_event_t *event)
 }
 
 
-void stats_set_time (long handle, const char *name, int flags, time_t tm)
+void stats_set_time (stats_handle_t handle, const char *name, int flags, time_t tm)
 {
     char buffer[100];
 
@@ -1349,34 +1359,57 @@ void stats_purge (time_t mark)
 }
 
 
-void stats_global_calc (void)
+void stats_global_calc (time_t now)
 {
-    stats_event_t event;
+    stats_event_t clients, listeners;
     avl_node *anode;
-    char buffer [VAL_BUFSIZE];
+    char buf1 [VAL_BUFSIZE];
+    char buf2 [VAL_BUFSIZE];
+    char buf3 [VAL_BUFSIZE];
 
+    global_lock();
     connection_stats ();
-    avl_tree_rlock (_stats.global_tree);
+
+    snprintf (buf1, sizeof(buf1), "%" PRIu64, (int64_t)global.clients);
+
+    snprintf (buf2, sizeof(buf2), "%" PRIu64, (int64_t)global.listeners);
+    snprintf (buf3, sizeof(buf3), "%" PRIu64,
+            (int64_t)global_getrate_avg (global.out_bitrate) * 8 / 1024);
+    global_unlock();
+
+    build_event (&clients, NULL, "clients", buf1);
+    clients.flags |= STATS_COUNTERS;
+    process_event (&clients);
+    build_event (&listeners, NULL, "listeners", buf2);
+    listeners.flags |= STATS_COUNTERS;
+    process_event (&listeners);
+
+    avl_tree_wlock (_stats.global_tree);
     anode = avl_get_first(_stats.global_tree);
     while (anode)
     {
         stats_node_t *node = (stats_node_t *)anode->key;
 
         if (node->flags & STATS_REGULAR)
-            stats_listener_send (node->flags, "EVENT global %s %s\n", node->name, node->value);
+        {
+            if (node->last_reported + 9 < now)
+            {
+                stats_listener_send (node->flags, "EVENT global %s %s\n", node->name, node->value);
+                DEBUG2 ("update global %s (%s)", node->name, node->value);
+                node->last_reported = now;
+            }
+        }
         anode = avl_get_next (anode);
     }
     avl_tree_unlock (_stats.global_tree);
-    build_event (&event, NULL, "outgoing_kbitrate", buffer);
-    event.flags = STATS_COUNTERS|STATS_HIDDEN;
 
-    snprintf (buffer, sizeof(buffer), "%" PRIu64,
-            (int64_t)global_getrate_avg (global.out_bitrate) * 8 / 1024);
-    process_event (&event);
+    build_event (&clients, NULL, "outgoing_kbitrate", buf3);
+    clients.flags = STATS_COUNTERS|STATS_HIDDEN;
+    process_event (&clients);
 }
 
 
-long stats_handle (const char *mount)
+stats_handle_t stats_handle (const char *mount)
 {
     stats_source_t *src_stats;
 
@@ -1400,22 +1433,22 @@ long stats_handle (const char *mount)
     avl_tree_wlock (src_stats->stats_tree);
     avl_tree_unlock (_stats.source_tree);
 
-    return (long)src_stats;
+    return (stats_handle_t)src_stats;
 }
 
 
-long stats_lock (long handle, const char *mount)
+stats_handle_t stats_lock (stats_handle_t handle, const char *mount)
 {
     stats_source_t *src_stats = (stats_source_t *)handle;
     if (src_stats == NULL)
         src_stats = (stats_source_t*)stats_handle (mount);
     else
         avl_tree_wlock (src_stats->stats_tree);
-    return (long)src_stats;
+    return (stats_handle_t)src_stats;
 }
 
 
-void stats_release (long handle)
+void stats_release (stats_handle_t handle)
 {
     stats_source_t *src_stats = (stats_source_t *)handle;
     if (src_stats)
@@ -1424,7 +1457,7 @@ void stats_release (long handle)
 
 
 // drops stats attached to this handle but don't remove the handle itself
-void stats_flush (long handle)
+void stats_flush (stats_handle_t handle)
 {
     if (handle)
     {
@@ -1446,7 +1479,7 @@ void stats_flush (long handle)
 
 
 // assume source stats are write locked 
-void stats_set (long handle, const char *name, const char *value)
+void stats_set (stats_handle_t handle, const char *name, const char *value)
 {
     if (handle)
     {
@@ -1459,7 +1492,7 @@ void stats_set (long handle, const char *name, const char *value)
 }
 
 
-void stats_set_inc (long handle, const char *name)
+void stats_set_inc (stats_handle_t handle, const char *name)
 {
     if (handle)
     {
@@ -1474,7 +1507,7 @@ void stats_set_inc (long handle, const char *name)
 }
 
 
-void stats_set_args (long handle, const char *name, const char *format, ...)
+void stats_set_args (stats_handle_t handle, const char *name, const char *format, ...)
 {
     va_list val;
     int ret;
@@ -1497,7 +1530,7 @@ void stats_set_args (long handle, const char *name, const char *format, ...)
 }
 
 
-void stats_set_expire (long handle, time_t mark)
+void stats_set_expire (stats_handle_t handle, time_t mark)
 {
     stats_source_t *src_stats = (stats_source_t *)handle;
     
@@ -1506,7 +1539,7 @@ void stats_set_expire (long handle, time_t mark)
 }
 
 
-void stats_set_flags (long handle, const char *name, const char *value, int flags)
+void stats_set_flags (stats_handle_t handle, const char *name, const char *value, int flags)
 {
     stats_source_t *src_stats = (stats_source_t *)handle;
     stats_event_t event;
@@ -1535,7 +1568,7 @@ static int contains_xml_entity (const char *value)
 }
 
 
-static void stats_set_entity_decode (long handle, const char *name, const char *value)
+static void stats_set_entity_decode (stats_handle_t handle, const char *name, const char *value)
 {
     if (contains_xml_entity (value))
     {
@@ -1562,7 +1595,7 @@ static void stats_set_entity_decode (long handle, const char *name, const char *
 }
 
 
-void stats_set_conv (long handle, const char *name, const char *value, const char *charset)
+void stats_set_conv (stats_handle_t handle, const char *name, const char *value, const char *charset)
 {
     if (charset)
     {

@@ -39,7 +39,7 @@ struct connection_tag
     uint64_t id;
 
     time_t con_time;
-    union {
+    struct {
         time_t      time;
         uint64_t    offset;
     } discon;
@@ -48,8 +48,10 @@ struct connection_tag
     sock_t sock;
     unsigned int chunk_pos; // for short writes on chunk size line
     char error;
+    unsigned char readchk;
 
 #ifdef HAVE_OPENSSL
+    unsigned char sslflags;
     SSL *ssl;   /* SSL handler */
 #endif
 
@@ -82,6 +84,7 @@ void connection_shutdown(void);
 void connection_thread_startup();
 void connection_thread_shutdown();
 int  connection_setup_sockets (struct ice_config_tag *config);
+void connection_reset (connection_t *con, uint64_t time_ms);
 void connection_close(connection_t *con);
 int  connection_init (connection_t *con, sock_t sock, const char *addr);
 void connection_uses_ssl (connection_t *con);
@@ -95,6 +98,8 @@ void connection_bufs_flush (struct connection_bufs *v);
 int  connection_bufs_append (struct connection_bufs *vectors, void *buf, unsigned int len);
 int  connection_bufs_read (connection_t *con, struct connection_bufs *vecs, int skip);
 int  connection_bufs_send (connection_t *con, struct connection_bufs *vecs, int skip);
+int  connection_unreadable (connection_t *con);
+
 
 #define CHUNK_HDR_SZ            16
 

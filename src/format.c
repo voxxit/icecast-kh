@@ -124,6 +124,7 @@ int format_get_plugin (format_plugin_t *plugin)
         INFO1 ("internal format details already created for %s", plugin->mount);
         return 0;
     }
+    plugin->qblock_copy = refbuf_copy_default;
     switch (plugin->type)
     {
         case FORMAT_TYPE_OGG:
@@ -145,6 +146,40 @@ int format_get_plugin (format_plugin_t *plugin)
 }
 
 
+int format_check_frames (struct format_check_t *c)
+{
+    int ret = -1;
+    refbuf_t *r = refbuf_new (16384);
+    mpeg_sync sync;
+    mpeg_setup (&sync, c->desc);
+    mpeg_check_numframes (&sync, 20);
+
+    do
+    {
+        int bytes = pread (c->fd, r->data, 16384, 0);
+        if (bytes <= 0)
+            break;
+
+        r->len = bytes;
+        int unprocessed = mpeg_complete_frames (&sync, r, 0);
+        if (r->len == 0)
+        {
+            break;
+        }
+        c->offset = bytes - (r->len + unprocessed);
+        c->type = mpeg_get_type (&sync);
+        c->srate = mpeg_get_samplerate (&sync);
+        c->channels = mpeg_get_channels (&sync);
+        c->bitrate = mpeg_get_bitrate (&sync);
+        ret = 0;
+    } while (0);
+    refbuf_release (r);
+    mpeg_cleanup (&sync);
+
+    return ret;
+}
+
+
 int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle f)
 {
     refbuf_t *refbuf = client->refbuf;
@@ -159,7 +194,6 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
             if (file_in_use (f) == 0)
                 return -2;
             refbuf = client->refbuf = refbuf_new (len);
-            client->flags |= CLIENT_HAS_INTRO_CONTENT;
             client->pos = refbuf->len;
             client->queue_pos = 0;
             refbuf->flags |= BUFFER_LOCAL_USE;
@@ -192,9 +226,12 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
                 DEBUG1 ("End of requested range (%" PRId64 ")", client->connection.discon.offset);
                 return -1;
             }
-            range = client->connection.discon.offset - client->intro_offset + 1;
-            if (range < len)
-                len = range;
+            if (client->connection.discon.offset < (uint64_t)-1)
+            {
+                range = client->connection.discon.offset - client->intro_offset + 1;
+                if (range && range < len)
+                    len = range;
+            }
         }
         else
             if (client->connection.discon.time && client->worker->current_time.tv_sec >= client->connection.discon.time)
@@ -202,26 +239,9 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
 
         bytes = pread (f, refbuf->data, len, client->intro_offset);
         if (bytes <= 0)
-            return bytes < 0 ? -2 : -1;
-
-        if (client->connection.sent_bytes > 0 && client->intro_offset == 0 &&
-                bytes >= 10 && memcmp (refbuf->data, "ID3", 3) == 0)
         {
-            // special case of filtering ID3 from fallback files
-            unsigned char *p = (unsigned char*)refbuf->data;
-
-            if (p[3] < 0xFF && p[4] < 0xFF && (p[5] & 0xF) == 0)
-            {
-                int ver = p[3], rev = p[4];
-                size_t size = (p[6] & 0x7f);
-                size = (size << 7) + (p[7] & 0x7f);
-                size = (size << 7) + (p[8] & 0x7f);
-                size = (size << 7) + (p[9] & 0x7f);
-
-                client->intro_offset = size + 10;
-                DEBUG3 ("Detected ID3v2 (%d.%d) in file, tag size %" PRIu64, ver, rev, (uint64_t)size);
-                continue;
-            }
+            client->flags &= ~CLIENT_HAS_INTRO_CONTENT;
+            return bytes < 0 ? -2 : -1;
         }
         refbuf->len = bytes;
         client->pos = 0;
@@ -244,6 +264,8 @@ int format_file_read (client_t *client, format_plugin_t *plugin, icefile_handle 
             }
         }
         client->intro_offset += (bytes - unprocessed);
+        if (unprocessed == 0 && refbuf->len)
+            break;
     } while (1);
     return refbuf->len - client->pos;
 }
@@ -272,7 +294,7 @@ int format_generic_write_to_client (client_t *client)
 int format_general_headers (format_plugin_t *plugin, client_t *client)
 {
     unsigned remaining = 4096 - client->refbuf->len;
-    char *ptr = client->refbuf->data + client->refbuf->len, *junk = NULL;
+    char *ptr = client->refbuf->data + client->refbuf->len;
     int bytes = 0;
     int bitrate_filtered = 0;
     avl_node *node;
@@ -297,9 +319,10 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
     if (client->respcode == 0)
     {
         const char *useragent = httpp_getvar (client->parser, "user-agent");
-        const char *protocol = (client->flags & CLIENT_KEEPALIVE) ?  "HTTP/1.1" : "HTTP/1.0";
+        const char *ver = httpp_getvar (client->parser, HTTPP_VAR_VERSION);
+        const char *protocol;
         const char *contenttypehdr = "Content-Type";
-        const char *contenttype = plugin->contenttype;
+        const char *contenttype = plugin ? plugin->contenttype : "application/octet-stream";
         const char *fs = httpp_getvar (client->parser, "__FILESIZE");
         const char *opt = httpp_get_query_param (client->parser, "_hdr");
         int fmtcode = 0;
@@ -310,13 +333,17 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
 
         do
         {
+            if (ver && strcmp (ver, "1.1") == 0)
+                protocol = "HTTP/1.1";
+            else
+                protocol = "HTTP/1.0";
             if (opt)
             {
                 fmtcode = atoi (opt);
                 break;
             }
             // ignore following settings for files.
-            if (fs == NULL && useragent)
+            if (fs == NULL && useragent && plugin)
             {
                 if (strstr (useragent, "shoutcastsource")) /* hack for mpc */
                     fmtcode = FMT_RETURN_ICY;
@@ -359,54 +386,67 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
             if (length && client->connection.discon.offset > length)
                 client->connection.discon.offset = length - 1;
 
-            if (client->connection.discon.offset == 0 || client->intro_offset >= client->connection.discon.offset)
+            if (client->intro_offset > client->connection.discon.offset)
             {
-                DEBUG2 ("client range invalid (%ld, %" PRIu64 ")", client->intro_offset, client->connection.discon.offset);
+                DEBUG2 ("client range invalid (%ld, %" PRIu64 ")", (long)client->intro_offset, client->connection.discon.offset);
                 return -1;
             }
-            length = client->connection.discon.offset - client->intro_offset + 1;
-            if (fs && length > 10) // allow range on files
+            uint64_t len = client->connection.discon.offset - client->intro_offset + 1;
+            char total_size [32] = "*";
+
+            if (fs) // allow range on files
             {
+                snprintf (total_size, sizeof total_size, "%" PRIu64, length);
                 client->respcode = 206;
+            }
+            else
+            {
+                // ignore ranges on streams, treat as full
+                client->connection.discon.offset = 0;
+                client->intro_offset = 0;
+                client->flags &= ~CLIENT_RANGE_END;
+                len = 0;
+            }
+            length = len;
+            if (length)
+            {
                 bytes = snprintf (ptr, remaining, "%s 206 Partial Content\r\n"
                         "%s: %s\r\n"
                         "Accept-Ranges: bytes\r\n"
                         "Content-Length: %" PRIu64 "\r\n"
-                        "Content-Range: bytes %" PRIu64 "-%" PRIu64 "/%" PRIu64 "\r\n",
+                        "Content-Range: bytes %" PRIu64 "-%" PRIu64 "/%s\r\n",
                         protocol, contenttypehdr,
                         contenttype ? contenttype : "application/octet-stream",
-                        length, (uint64_t)client->intro_offset,
-                        client->connection.discon.offset, length);
+                        len, (uint64_t)client->intro_offset,
+                        client->connection.discon.offset, total_size);
+                client->respcode = 206;
             }
-            else
+            if (client->parser->req_type != httpp_req_head && length < 100 && (client->flags & CLIENT_RANGE_END) && fs == NULL)
             {
-                // treat range 0- as if no range set, for chrome
-                if (client->connection.discon.offset == (uint64_t)-1)
-                {
-                    client->connection.discon.offset = 0;
-                    client->intro_offset = 0;
-                    client->flags &= ~CLIENT_RANGE_END;
-                    length = 0;
-                }
-                else
-                {
-                    // for range requests on streams we return a 200 OK but only send a couple of bytes
-                    length = 2;
-                    client->connection.discon.offset = client->intro_offset + 2;
-                    if (client->parser->req_type != httpp_req_head && remaining - bytes > length + 2)
-                    {
-                        junk = malloc (length+1);
-                        memset (junk, 255, length);
-                        junk[length] = '\0';
-                        plugin = NULL;
-                        client->flags &= ~CLIENT_AUTHENTICATED;
-                        DEBUG2 ("wrote %d bytes for partial request from %s", (int)length, &client->connection.ip[0]);
-                    }
-                }
+                refbuf_t *r = refbuf_new (length);
+                memset (r->data, 255, length);
+                refbuf_release (client->refbuf->next); // truncate any, maybe intro content
+                client->refbuf->next = r;
+                r->flags |= WRITE_BLOCK_GENERIC;
+                plugin = NULL;
+                client->flags &= ~(CLIENT_AUTHENTICATED|CLIENT_HAS_INTRO_CONTENT); // drop these flags
+                DEBUG2 ("wrote %d bytes for partial request from %s", (int)length, &client->connection.ip[0]);
             }
         }
         if (client->respcode == 0)
         {
+            char datebuf [100] = "\0";
+            struct tm result;
+
+            if (gmtime_r (&client->worker->current_time.tv_sec, &result))
+            {
+                if (strftime (datebuf, sizeof(datebuf), "Date: %a, %d %b %Y %X GMT\r\n", &result) == 0)
+                {
+                    datebuf[0] = '\0';
+                    sock_set_error (0);
+                }
+            }
+
             if (contenttype == NULL)
                 contenttype = "application/octet-stream";
             if (length)
@@ -414,28 +454,27 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
                 client->respcode = 200;
                 bytes = snprintf (ptr, remaining, "%s 200 OK\r\n"
                         "Content-Length: %" PRIu64 "\r\n"
-                        "%s: %s\r\n", protocol, length, contenttypehdr, contenttype);
+                        "%s: %s\r\n%s", protocol, length, contenttypehdr, contenttype, datebuf);
             }
             else
             {
-                int chunked = 0; // (ver == NULL || strcmp (ver, "1.0") == 0) ? 0 : 1;
+                int chunked = 0;
                 const char *TE = "";
 
-                if (plugin->flags & FORMAT_FL_ALLOW_HTTPCHUNKED)
+                if (plugin && plugin->flags & FORMAT_FL_ALLOW_HTTPCHUNKED)
                 {
-                    const char *ver = httpp_getvar (client->parser, HTTPP_VAR_VERSION);
                     chunked = (ver == NULL || strcmp (ver, "1.0") == 0) ? 0 : 1;
                 }
                 if (chunked && (fmtcode & FMT_DISABLE_CHUNKED) == 0)
                 {
                     client->flags |= CLIENT_CHUNKED;
                     TE = "Transfer-Encoding: chunked\r\n";
-                    protocol = "HTTP/1.1";
                 }
                 client->flags &= ~CLIENT_KEEPALIVE;
                 client->respcode = 200;
-                bytes = snprintf (ptr, remaining, "%s 200 OK\r\nAccept-Ranges: bytes\r\n%s"
-                        "%s: %s\r\n", protocol, TE, contenttypehdr, contenttype);
+
+                bytes = snprintf (ptr, remaining, "%s 200 OK\r\n%s"
+                        "%s: %s\r\n%s", protocol, TE, contenttypehdr, contenttype, datebuf);
             }
         }
         remaining -= bytes;
@@ -473,7 +512,8 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
             else
             {
                 if (strcasecmp (var->name, "ice-password") &&
-                        strcasecmp (var->name, "icy-metaint"))
+                        strcasecmp (var->name, "icy-metaint") &&
+                        strncasecmp (var->name, "Access-control-", 15))
                 {
                     if (!strncasecmp ("ice-", var->name, 4))
                     {
@@ -509,23 +549,18 @@ int format_general_headers (format_plugin_t *plugin, client_t *client)
     remaining -= bytes;
     ptr += bytes;
 
-    /* prevent proxy servers from caching */
-    bytes = snprintf (ptr, remaining, "Cache-Control: no-cache, no-store\r\nPragma: no-cache\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Headers: Origin, Accept, X-Requested-With, Content-Type\r\n"
-            "Access-Control-Allow-Methods: GET, OPTIONS, HEAD\r\n"
-            "%s\r\n"
-            "Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n", client_keepalive_header (client));
+    bytes = snprintf (ptr, remaining, "Cache-Control: no-cache, no-store\r\n"
+            "Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n"
+            "%s\r\n", client_keepalive_header (client));
     remaining -= bytes;
     ptr += bytes;
 
-    bytes = snprintf (ptr, remaining, "\r\n%s", junk ? junk : "");
+    bytes = client_add_cors (client, ptr, remaining);
     remaining -= bytes;
     ptr += bytes;
 
     client->refbuf->len = 4096 - remaining;
     client->refbuf->flags |= WRITE_BLOCK_GENERIC;
-    free (junk);
     return 0;
 }
 

@@ -1,4 +1,4 @@
-Feature differences from SVN trunk
+Feature differences from Xiph release
 
 . FLV wrapping for mp3/aac listeners requesting it with ?type=.flv
 . define a fixed number of worker threads (default 1) for processing clients
@@ -13,9 +13,210 @@ Feature differences from SVN trunk
 . mount can filter out theora content, useful for defining a local relay
   of a theora+vorbis stream to have a vorbis only stream from the same source.
 . handlers setting for URL authenticator, for N requests at a time.
+. allows for using seconds as a measure for the queue/min/burst sizes
+. multiple ICY sources on single port
 
-any extra tags are show in the conf/icecast.xml.dist file
+any extra tags are shown in the conf/icecast.xml.dist file
 
+2.4.0-kh15
+. Locking updates. For most, it will be no different but some platforms can be affected
+. Keep consistency on the global listener count. Could of shown as very large number.
+. Fix issue with fallback override of listeners. listeners being dropped
+. Fix broken parameter to on-[dis]connect script on previous release.
+. Small update for CORS handling.
+. Fix YP updating.  Long standing error flagged up on directory changes.
+. Update for listeners moving between workers for load balancing.
+. Small update for the FLV-aac wrapping in previous release.
+. Fix up range request bug.
+. Fix various log related issues.
+. Some internal code cleanup
+
+2.4.0-kh14
+. Allow for using secs (eg 5s) in queue/min-queue/burst measures.
+. Allow multiple icy sources on same port. Just embed in password a mountpoint:pass. The
+  shoutcast-mount tag still creates the +1 port and sets a default mountpoint but source
+  can override this.
+. Fix log issue which could cause a deadlock if on-[dis]connect or auth cmd are used.
+. Allow configure to accept ICY_CHARSET to set alternate in build.  The default ICY
+  metadata is assumed to be UTF8, but some sites still have issues with setting tags or
+  parameters, so allow a different default if they need it.
+. Regression on FLV wrapped aac metadata fixed.
+. Crash/corruption fix if using stream auth and metadata updates via admin.
+. Fix for glibc rwlock priority
+. Added the icy-metadata in headers allowed with CORS
+. Rework XFF to be earlier, useful in cases where banned IPs apply.
+. Allow wildcards in XFF
+. Drop the BSD NOPUSH setting for now. Have seen poor performance because of it in
+  certain cases
+. Openssl API cleanups. eg API differences between versions.
+. various small fixes, build and operational.
+
+2.4.0-kh13
+. Fix an annoying race case. memory corruption in certain cases that are hard to trigger
+  normally but typically involes a listener disconnecting in certain conditions.
+. tightened up use-after-free cases with regard to the queue pruning.
+. leak fixes with intro via auth.
+. Allow seconds to be specified in burst and queue size fields. Just specify the number followed by s
+  eg 30s  or 5s. Eventually we could make this the default so that is can apply to various
+  bitrates.
+. small minor cleanups across the board.
+
+2.4.0-kh12
+. fix up some incorrect or stale block cases from previous release for non-ogg streams. Usually
+  cause by short write triggers or queue jumps.
+. change default charset for non-ogg streams to utf8 instead of latin1, you ca still use
+  latin1 either with <charset> mount setting or charset= query param to metadata
+. global listeners count could get messed up with fallback to files, also make it a regular
+  update stat in-line with other global stats.
+. avoid possible crash case on log re-opening, not so common.
+
+
+2.4.0-kh11
+. fix issue with timelimited listeners and html5 players with range requests
+. security fix for auth url when allowing certain headers to be passed.
+. fix for mpeg block expansion handling, led to cases of parsing failures
+. block scaling changes for mpeg based streams.
+. internal restructure for metadata on non-ogg streams. For code maintainability.
+. bounce admin mount request clients to worker with the source, reduces lock contention with lots of sources
+
+2.4.0-kh10
+. stop ID3 in streams for now, some browsers can have playback problems.
+. fix memory leak case in the queue from previous release.
+. fix crash bug on source timeout
+. various internal changes for building, rate calculations
+
+2.4.0-kh9
+. pre-roll logging options. like access log but report client details of intros played. Can be
+  per-mount or global. Also allow for IP recording to prevent intro play if reconnected within
+  N seconds.
+. add tag ssl-cafile to refer to a CA bundle other than the default. This way the cert is not
+  required to include it.
+. allow /admin/metadata to accept param intro or preroll to change the intro file used on a source.
+. split explicit mounts from list into a tree for quick lookup. speeds up updating with many mount
+  definitions.
+. max-listeners setting in limits for server wide limitations.
+. worker balancing updates. avoid a lot of bouncing between workers for sources and allow more
+  listeners to be attracted to their source worker.
+. clean up shutdown procedure for race handling.
+. smaller SSL handling cleanup.
+. log messaging update.
+. mpeg parsing updates. Allows for better detection and reporting, identifies mismatches better,
+  and detects a few more frame types. The sync structure is also reduced so should help in caching.
+. rate averaging update.
+. minor tuning for intro drops, fix for 0- range requests and intros.
+. delay opening intro file until stream has started up, allows for format matching.
+. lessen write lock scope when reading xml.
+. failing to bind a socket at startup should be a termination event, although not on a reload.
+
+
+
+2.4.0-kh8
+
+. Logging. An issue was reported on log cycling triggers, should be the last now. This time it
+seems to stem from a cycle triggered externally where a new log is created for appending before
+doing the reopen.  This is now fixed.
+
+. Expand the worker limiter when processing lots of clients in one pass. This was leading to
+some seeing sources not getting cleaned up as the listeners were not getting serviced.  There
+is still a cap but is extermely large and can be bypassed on cleanup cases.
+
+. Incoming worker thread added. Normally incoming clients, after passing the initial IP checks
+get passed on to worker threads for subsequent pocessing.   This can lead to a lot of wakeup
+for the usual worker threads to process these especially if they are short (eg playlist) or
+involve filtering or kicking off auth. The extreme case being a DoS type of thing, where the
+wakeup often causes the worker to do a big list traversal slowing things down as it gets busy.
+This new worker thread deals with the initial aspects, http parsing, initial request handling
+and is only moved to the normal workers for sources, listeners and some static content.
+
+. Add "headers" and "header_prefix" options onto auth url. To bring into line with the Xiph
+build.  It is possible that some sites would want to inspect certain headers passed by
+clients to authenticate. We do not want to pass all of them as that can be large and for such
+situations, particular headers are limited, the prime example of these is cookies.  To avoid
+POST tag name clashes with existing established tags passed in aurl auth, these headers are
+supplied with a prefix, defaulting to "ClientHeader-"
+
+. Stats. A number of global stats are now reported every 10 seconds or the next second if
+they have changed.  This reduces load on a stats link and can save on logging if you have
+that level enabled.
+
+. A small set of code cleanups
+
+2.4.0-kh7
+. fix up recent ssl update to build against openssl 1.1
+. drop range requests on streams, was breaking iOS 11.
+. log typo fix
+
+2.4.0-kh6
+. drop client is read channel is closed off, handles proxies better like AWS.
+. Logging
+  better log messaging at startup if change owner used.
+  fixed race bug generally affecting the per-mount logs, excessive purging.
+  fix auto log cyclying
+. Add listeners= to POST on auth url. current listener count in the stats
+. internal improvement to cached entries for addresses
+. SSL updates
+  build fix where no SSL is available
+  allow for DH/ECDH
+  allow for reading the cert before dropping privs, but keep certificate if reload is fails.
+  crash fix if no SSL certificate defined.
+  small fix for internal openssl threading.
+
+
+2.4.0-kh5
+. use a separate thread for logging, prevents worker stalls in certain setups.
+. backward compatibile playlist archive setting fix.
+. update IPv6 handling. This is really an internal update but allows for both
+  IPv4/IPv6 listening sockets to be created from one listen-socket block. This
+  allows for windows builds to have IPv6 as well.
+. autodetect SSL connections on incoming sockets. No need for <ssl> in listen-socket
+  now but is still there for compatability.
+. add <ssl-private-key> in <paths> to allow for combined PEM or for separate SSL
+  key/certificate files.
+. select https/http URL in autogenerated m3u based on incoming request.
+. minor update to windows service creation. No functional change
+
+2.4.0-kh4
+. handle really short icy intervals from relayed streams.
+. updates for header handling, ranges, auth/html5 etc
+. invalidate requests on windows ending with dot, could be used for extension trickery
+. have clients stats reported once per second instead of after a change.
+. use CORK/PUSH setting if available else fall back to nodelay.
+. added so-mss setting to listen-socket.
+. missing run-on setting for master now fixed, defaults to 30s.
+. auth cmd drops LD_PRELOAD, stdin/out/err and handle errors better.
+. various internal code cleanups, boundary checks, log messages
+. build updates
+  - autofoo mostly from rubenk
+  - type cleanups for win64
+
+2.4.0-kh3
+. fixes for range handling for certain players like iphone/chrome
+. fixes for burst handling with intro playback
+. ID3 pushed into the frame parser.
+. adjustments to having a wider range of block sizes on non-ogg streams
+. adjustments to scheduling of clients.
+. added agent to listener remove on url auth
+. force SSLv3 off the ciphers.
+
+2.4.0-kh2
+. possible global listener count error fixed
+. possible crash with FLV and fallback handling fixed
+. FLV throttle fixup when dealing with files
+. fix up case for requeue on lagging client.
+. use throttling thresholds based on bitrate
+. scale non-ogg blocks based on bitrate but still enforce a send limit with an
+  optional <max-send-size> tag. not usually needed
+. implementation of HTTP keep-alive, mainly for web type requests.
+. add <redirect-to> tag in <mount>, similar to <redirect> but allows for expansion
+  such as ${mount}. the redirect tag is just an alias of this now.
+. intro file sending had no burst calculations.
+. allow for auth bypass in certain very limited cases, like small range requests used
+  by certain clients, or HEAD requests.
+. HTTP header cleanups depending on the request, content length etc
+. allow for byte accurate drop, this is for range requests for some clients.
+. shutdown cleanups, to avoid stalls.
+. tidy up xml page error reporting.
+. build updates
 
 2.4.0-kh1
 . fix for the 'Detected an entity reference loop' message

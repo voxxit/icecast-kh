@@ -9,7 +9,7 @@
  *                      Karl Heyes <karl@xiph.org>
  *                      and others (see AUTHORS for details).
  *
- * Copyright 2000-2014, Karl Heyes <karl@kheyes.plus.com>
+ * Copyright 2000-2020, Karl Heyes <karl@kheyes.plus.com>
  *
  */
 
@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "thread/thread.h"
 #include "avl/avl.h"
@@ -49,8 +50,12 @@
 #undef CATMODULE
 #define CATMODULE "client"
 
-int worker_count, worker_min_count;
-worker_t *worker_balance_to_check, *worker_least_used;
+int worker_count = 0, worker_min_count;
+worker_t *worker_balance_to_check, *worker_least_used, *worker_incoming = NULL;
+
+FD_t logger_fd[2];
+
+static void logger_commits (int id);
 
 
 void client_register (client_t *client)
@@ -128,12 +133,14 @@ void client_destroy(client_t *client)
     client->respcode = 0;
     client->free_client_data = NULL;
 
+    if (not_ssl_connection (&client->connection))
+        sock_set_cork (client->connection.sock, 0); // ensure any corked data is actually sent.
+
     global_lock ();
     if (global.running != ICE_RUNNING || client->connection.error ||
             (client->flags & CLIENT_KEEPALIVE) == 0 || client_connected (client) == 0)
     {
         global.clients--;
-        stats_event_args (NULL, "clients", "%d", global.clients);
         config_clear_listener (client->server_conn);
         global_unlock ();
         connection_close (&client->connection);
@@ -142,17 +149,19 @@ void client_destroy(client_t *client)
         return;
     }
     global_unlock ();
-    DEBUG0 ("keepalive detected, placing back onto worker");
+    DEBUG1 ("keepalive detected on %s, placing back onto worker", client->connection.ip);
+    if (not_ssl_connection (&client->connection))
+        sock_set_cork (client->connection.sock, 1);    // reenable cork for the next go around
     client->counter = client->schedule_ms = timing_get_time();
-    client->connection.con_time = client->schedule_ms/1000;
-    client->connection.discon.time = client->connection.con_time + 7;
+    connection_reset (&client->connection, client->schedule_ms);
+
     client->ops = &http_request_ops;
     client->flags = CLIENT_ACTIVE;
     client->shared_data = NULL;
     client->refbuf = NULL;
     client->pos = 0;
-    client->intro_offset = client->connection.sent_bytes = 0;
-    client_add_worker (client);
+    client->intro_offset = 0;
+    client_add_incoming (client);
 }
 
 
@@ -193,7 +202,7 @@ int client_read_bytes (client_t *client, void *buf, unsigned len)
     bytes = con_read (&client->connection, buf, len);
 
     if (bytes == -1 && client->connection.error)
-        DEBUG0 ("reading from connection has failed");
+        DEBUG2 ("reading from connection %"PRIu64 " from %s has failed", client->connection.id, &client->connection.ip[0]);
 
     return bytes;
 }
@@ -207,7 +216,7 @@ int client_send_302(client_t *client, const char *location)
     client_set_queue (client, NULL);
     client->refbuf = refbuf_new (PER_CLIENT_REFBUF_SIZE);
     len = snprintf (body, sizeof body, "Moved <a href=\"%s\">here</a>\r\n", location);
-    snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
+    len = snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
             "HTTP/1.0 302 Temporarily Moved\r\n"
             "Content-Type: text/html\r\n"
             "Content-Length: %d\r\n"
@@ -291,7 +300,7 @@ int client_send_404 (client_t *client, const char *message)
         return 0;
     }
     client_set_queue (client, NULL);
-    if (client->respcode)
+    if (client->respcode || client->connection.error)
     {
         worker_t *worker = client->worker;
         if (client->respcode >= 300)
@@ -342,16 +351,33 @@ int client_send_501(client_t *client)
 }
 
 
+int client_add_cors (client_t *client, char *buf, int remain)
+{
+    int bytes = 0;
+    const char *cred = "", *origin = httpp_getvar (client->parser, "origin");
+    if (origin)
+        cred = "Access-Control-Allow-Credentials: true\r\n";
+    else
+        origin = "*";
+
+    bytes = snprintf (buf, remain,
+            "Access-Control-Allow-Origin: %s\r\n%s"
+            "Access-Control-Allow-Headers: Origin, Accept, X-Requested-With, Content-Type, Icy-MetaData\r\n"
+            "Access-Control-Allow-Methods: GET, OPTIONS, SOURCE, PUT, HEAD, STATS\r\n\r\n",
+            origin, cred);
+    return bytes;
+}
+
+
 int client_send_options(client_t *client)
 {
     client_set_queue (client, NULL);
     client->refbuf = refbuf_new (PER_CLIENT_REFBUF_SIZE);
-    snprintf (client->refbuf->data, PER_CLIENT_REFBUF_SIZE,
+    char *ptr = client->refbuf->data;
+    int bytes = snprintf (ptr, PER_CLIENT_REFBUF_SIZE,
             "HTTP/1.1 200 OK\r\n"
-            "Connection: Keep-alive\r\n"
-            "Access-Control-Allow-Origin: *\r\n"
-            "Access-Control-Allow-Headers: Origin, Accept, X-Requested-With, Content-Type\r\n"
-            "Access-Control-Allow-Methods: GET, OPTIONS, HEAD, STATS\r\n\r\n");
+            "Connection: Keep-alive\r\n");
+    client_add_cors (client, ptr+bytes, PER_CLIENT_REFBUF_SIZE-bytes);
     client->respcode = 200;
     client->refbuf->len = strlen (client->refbuf->data);
     return fserve_setup_client (client);
@@ -370,7 +396,7 @@ int client_send_bytes (client_t *client, const void *buf, unsigned len)
     ret = con_send (&client->connection, buf, len);
 
     if (client->connection.error)
-        DEBUG0 ("Client connection died");
+        DEBUG3 ("Client %"PRIu64 " connection on %s from %s died", client->connection.id, (client->mount ? client->mount:"unknown"), &client->connection.ip[0]);
 
     return ret;
 }
@@ -432,28 +458,44 @@ void client_set_queue (client_t *client, refbuf_t *refbuf)
     client->pos = 0;
 }
 
+int is_worker_incoming (worker_t *w)
+{
+    return (w == worker_incoming) ? 1 : 0;
+}
+
+static uint64_t worker_check_time_ms (worker_t *worker)
+{
+    uint64_t tm = timing_get_time();
+    if (tm - worker->time_ms > 1000 && worker->time_ms)
+        WARN2 ("worker %p has been stuck for %" PRIu64 " ms", worker, (tm - worker->time_ms));
+    return tm;
+}
+
 
 static worker_t *find_least_busy_handler (int log)
 {
     worker_t *min = workers;
+    int min_count = INT_MAX;
 
     if (workers && workers->next)
     {
-        worker_t *handler = workers->next;
+        worker_t *handler = workers;
 
-        worker_min_count = min->count + min->pending_count;
-        if (log) DEBUG2 ("handler %p has %d clients", min, worker_min_count);
         while (handler)
         {
+            thread_spin_lock (&handler->lock);
             int cur_count = handler->count + handler->pending_count;
+            thread_spin_unlock (&handler->lock);
+
             if (log) DEBUG2 ("handler %p has %d clients", handler, cur_count);
-            if (cur_count < worker_min_count)
+            if (cur_count < min_count)
             {
                 min = handler;
-                worker_min_count = cur_count;
+                min_count = cur_count;
             }
             handler = handler->next;
         }
+        worker_min_count = min_count;
     }
     return min;
 }
@@ -461,8 +503,6 @@ static worker_t *find_least_busy_handler (int log)
 
 worker_t *worker_selected (void)
 {
-    if ((worker_least_used->count + worker_least_used->pending_count) - worker_min_count > 20)
-        worker_least_used = find_least_busy_handler(1);
     return worker_least_used;
 }
 
@@ -508,47 +548,61 @@ void client_add_worker (client_t *client)
     worker_wakeup (handler);
 }
 
+void client_add_incoming (client_t *client)
+{
+    worker_t *handler;
+
+    thread_rwlock_rlock (&workers_lock);
+    handler = worker_incoming;
+    thread_spin_lock (&handler->lock);
+    thread_rwlock_unlock (&workers_lock);
+
+    worker_add_client (handler, client);
+    thread_spin_unlock (&handler->lock);
+    worker_wakeup (handler);
+}
+
 
 #ifdef _WIN32
 #define pipe_create         sock_create_pipe_emulation
 #define pipe_write(A, B, C) send(A, B, C, 0)
 #define pipe_read(A,B,C)    recv(A, B, C, 0)
 #else
-#ifdef HAVE_PIPE2
-#define pipe_create(x)      pipe2(x,O_CLOEXEC)
-#elif defined(FD_CLOEXEC)
-int pipe_create(int x[]) {
+ #ifdef HAVE_PIPE2
+ #define pipe_create(x)      pipe2(x,O_CLOEXEC)
+ #elif defined(FD_CLOEXEC)
+  int pipe_create(FD_t x[]) {
     int r = pipe(x); if (r==0) {fcntl(x[0], F_SETFD,FD_CLOEXEC); \
     fcntl(x[1], F_SETFD,FD_CLOEXEC); } return r;
-}
-#else
-#define pipe_create pipe
-#endif
-#define pipe_write write
-#define pipe_read read
+  }
+ #else
+  #define pipe_create pipe
+ #endif
+ #define pipe_write write
+ #define pipe_read read
 #endif
 
 
-static void worker_control_create (worker_t *worker)
+void worker_control_create (FD_t wakeup_fd[])
 {
-    if (pipe_create (&worker->wakeup_fd[0]) < 0)
+    if (pipe_create (&wakeup_fd[0]) < 0)
     {
         ERROR0 ("pipe failed, descriptor limit?");
         abort();
     }
-    sock_set_blocking (worker->wakeup_fd[0], 0);
-    sock_set_blocking (worker->wakeup_fd[1], 0);
+    sock_set_blocking (wakeup_fd[0], 0);
+    sock_set_blocking (wakeup_fd[1], 0);
 }
 
 
 static client_t **worker_add_pending_clients (worker_t *worker)
 {
+    thread_spin_lock (&worker->lock);
     if (worker->pending_clients)
     {
         unsigned count;
         client_t **p;
 
-        thread_spin_lock (&worker->lock);
         p = worker->last_p;
         *worker->last_p = worker->pending_clients;
         worker->last_p = worker->pending_clients_tail;
@@ -559,28 +613,29 @@ static client_t **worker_add_pending_clients (worker_t *worker)
         worker->pending_count = 0;
         thread_spin_unlock (&worker->lock);
         DEBUG2 ("Added %d pending clients to %p", count, worker);
-        if (worker->wakeup_ms > worker->time_ms+5)
-            return p;  /* only these new ones scheduled so process from here */
+        return p;  /* only these new ones scheduled so process from here */
     }
+    thread_spin_unlock (&worker->lock);
     worker->wakeup_ms = worker->time_ms + 60000;
     return &worker->clients;
 }
 
 
+// enter with spin lock enabled, exit without
+//
 static client_t **worker_wait (worker_t *worker)
 {
     int ret, duration = 2;
 
-    if (global.running == ICE_RUNNING)
+    if (worker->running)
     {
-        uint64_t tm = timing_get_time();
-        if (tm - worker->time_ms > 1000 && worker->time_ms)
-            WARN2 ("worker %p has been stuck for %lu ms", worker, (unsigned long)(tm - worker->time_ms));
+        uint64_t tm = worker_check_time_ms (worker);
         if (worker->wakeup_ms > tm)
             duration = (int)(worker->wakeup_ms - tm);
         if (duration > 60000) /* make duration at most 60s */
             duration = 60000;
     }
+    thread_spin_unlock (&worker->lock);
 
     ret = util_timed_wait_for_fd (worker->wakeup_fd[0], duration);
     if (ret > 0) /* may of been several wakeup attempts */
@@ -595,7 +650,7 @@ static client_t **worker_wait (worker_t *worker)
                 break;
             sock_close (worker->wakeup_fd[1]);
             sock_close (worker->wakeup_fd[0]);
-            worker_control_create (worker);
+            worker_control_create (&worker->wakeup_fd[0]);
             worker_wakeup (worker);
             WARN0 ("Had to recreate worker control feed");
         } while (1);
@@ -617,6 +672,7 @@ static void worker_relocate_clients (worker_t *worker)
         client_t *client = worker->clients, **prevp = &worker->clients;
 
         worker->wakeup_ms = worker->time_ms + 150;
+        worker->current_time.tv_sec = (time_t)(worker->time_ms/1000);
         while (client)
         {
             if (client->flags & CLIENT_ACTIVE)
@@ -644,6 +700,7 @@ static void worker_relocate_clients (worker_t *worker)
             worker->last_p = &worker->clients;
             worker->count = 0;
         }
+        thread_spin_lock (&worker->lock);
         worker_wait (worker);
     }
 }
@@ -653,7 +710,9 @@ void *worker (void *arg)
     worker_t *worker = arg;
     long prev_count = -1;
     client_t **prevp = &worker->clients;
+    uint64_t c = 0;
 
+    thread_rwlock_rlock (&global.workers_rw);
     worker->running = 1;
     worker->wakeup_ms = (int64_t)0;
     worker->time_ms = timing_get_time();
@@ -661,8 +720,9 @@ void *worker (void *arg)
     while (1)
     {
         client_t *client = *prevp;
-        uint64_t sched_ms = worker->time_ms + 2;
+        uint64_t sched_ms = worker->time_ms + 12;
 
+        c = 0;
         while (client)
         {
             if (client->worker != worker) abort();
@@ -672,8 +732,30 @@ void *worker (void *arg)
                 int ret = 0;
                 client_t *nx = client->next_on_worker;
 
-                if (worker->running == 0 || client->schedule_ms <= sched_ms || (client->wakeup && *client->wakeup))
+                int process = 1;
+                if (worker->running)  // force all active clients to run on worker shutdown
                 {
+                    if (client->schedule_ms <= sched_ms)
+                    {
+                        if (c > 9000 && client->wakeup == NULL)
+                            process = 0;
+                    }
+                    else if (client->wakeup == NULL || *client->wakeup == 0)
+                    {
+                        process = 0;
+                    }
+                }
+
+                if (process)
+                {
+                    if ((c & 511) == 0)
+                    {
+                        // update these periodically to keep in sync
+                        worker->time_ms = worker_check_time_ms (worker);
+                        worker->current_time.tv_sec = (time_t)(worker->time_ms/1000);
+                    }
+                    c++;
+                    errno = 0;
                     ret = client->ops->process (client);
                     if (ret < 0)
                     {
@@ -683,10 +765,12 @@ void *worker (void *arg)
                     }
                     if (ret)
                     {
+                        thread_spin_lock (&worker->lock);
                         worker->count--;
                         if (nx == NULL) /* is this the last client */
                             worker->last_p = prevp;
                         client = *prevp = nx;
+                        thread_spin_unlock (&worker->lock);
                         continue;
                     }
                 }
@@ -701,17 +785,18 @@ void *worker (void *arg)
             DEBUG2 ("%p now has %d clients", worker, worker->count);
             prev_count = worker->count;
         }
+        thread_spin_lock (&worker->lock);
         if (worker->running == 0)
         {
-            if (global.running == ICE_RUNNING)
-                break;
             if (worker->count == 0 && worker->pending_count == 0)
                 break;
         }
         prevp = worker_wait (worker);
     }
+    thread_spin_unlock (&worker->lock);
     worker_relocate_clients (worker);
     INFO0 ("shutting down");
+    thread_rwlock_unlock (&global.workers_rw);
     return NULL;
 }
 
@@ -719,22 +804,24 @@ void *worker (void *arg)
 // We pick a worker (consequetive) and set a max number of clients to move if needed
 void worker_balance_trigger (time_t now)
 {
-    int log_counts = (now % 10) == 0 ? 1 : 0;
-
-    if (worker_count == 1)
-        return; // no balance required, leave quickly
-    thread_rwlock_rlock (&workers_lock);
-
-    // lets only search for this once a second, not many times
-    worker_least_used = find_least_busy_handler (log_counts);
-    if (worker_balance_to_check)
+    thread_rwlock_wlock (&workers_lock);
+    if (worker_count > 1)
     {
-        worker_balance_to_check->move_allocations = 50;
-        worker_balance_to_check = worker_balance_to_check->next;
-    }
-    if (worker_balance_to_check == NULL)
-        worker_balance_to_check = workers;
+        int log_counts = (now & 15) == 0 ? 1 : 0;
 
+        worker_least_used = find_least_busy_handler (log_counts);
+        if (worker_balance_to_check)
+        {
+            worker_t *w = worker_balance_to_check;
+            // DEBUG2 ("Worker allocations reset on %p, least is %p", w, worker_least_used);
+            thread_spin_lock (&w->lock);
+            w->move_allocations = 200;
+            worker_balance_to_check = w->next;
+            thread_spin_unlock (&w->lock);
+        }
+        if (worker_balance_to_check == NULL)
+            worker_balance_to_check = workers;
+    }
     thread_rwlock_unlock (&workers_lock);
 }
 
@@ -743,18 +830,30 @@ static void worker_start (void)
 {
     worker_t *handler = calloc (1, sizeof(worker_t));
 
-    worker_control_create (handler);
+    worker_control_create (&handler->wakeup_fd[0]);
 
     handler->pending_clients_tail = &handler->pending_clients;
     thread_spin_create (&handler->lock);
-    thread_rwlock_wlock (&workers_lock);
     handler->last_p = &handler->clients;
+
+    thread_rwlock_wlock (&workers_lock);
+    if (worker_incoming == NULL)
+    {
+        worker_incoming = handler;
+        handler->move_allocations = 1000000;    // should stay fixed for this one
+        handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
+        thread_rwlock_unlock (&workers_lock);
+        INFO1 ("starting incoming worker thread %p", worker_incoming);
+        worker_start();  // single level recursion, just get a special worker thread set up
+        return;
+    }
     handler->next = workers;
     workers = handler;
     worker_count++;
     worker_least_used = worker_balance_to_check = workers;
-    handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
     thread_rwlock_unlock (&workers_lock);
+
+    handler->thread = thread_create ("worker", worker, handler, THREAD_ATTACHED);
 }
 
 
@@ -762,26 +861,44 @@ static void worker_stop (void)
 {
     worker_t *handler;
 
-    if (workers == NULL)
-        return;
     thread_rwlock_wlock (&workers_lock);
-    handler = workers;
-    workers = handler->next;
-    worker_least_used = worker_balance_to_check = workers;
-    if (workers)
-        workers->move_allocations = 100;
-    worker_count--;
+    do
+    {
+        if (worker_count > 0)
+        {
+            handler = workers;
+            workers = handler->next;
+            worker_least_used = worker_balance_to_check = workers;
+            if (workers)
+                workers->move_allocations = 1000;
+            worker_count--;
+        }
+        else
+        {
+            handler = worker_incoming;
+            worker_incoming = NULL;
+            INFO0 ("stopping incoming worker thread");
+        }
+
+        if (handler)
+        {
+            thread_spin_lock (&handler->lock);
+            handler->running = 0;
+            thread_spin_unlock (&handler->lock);
+
+            worker_wakeup (handler);
+            thread_rwlock_unlock (&workers_lock);
+
+            thread_join (handler->thread);
+            thread_spin_destroy (&handler->lock);
+
+            sock_close (handler->wakeup_fd[1]);
+            sock_close (handler->wakeup_fd[0]);
+            free (handler);
+            thread_rwlock_wlock (&workers_lock);
+        }
+    } while (workers == NULL && worker_incoming);
     thread_rwlock_unlock (&workers_lock);
-
-    handler->running = 0;
-    worker_wakeup (handler);
-
-    thread_join (handler->thread);
-    thread_spin_destroy (&handler->lock);
-
-    sock_close (handler->wakeup_fd[1]);
-    sock_close (handler->wakeup_fd[0]);
-    free (handler);
 }
 
 
@@ -802,3 +919,72 @@ void worker_wakeup (worker_t *worker)
 {
     pipe_write (worker->wakeup_fd[1], "W", 1);
 }
+
+
+static void logger_commits (int id)
+{
+    pipe_write (logger_fd[1], "L", 1);
+}
+
+static void *log_commit_thread (void *arg)
+{
+    INFO0 ("started");
+    thread_rwlock_rlock (&global.workers_rw);
+    while (1)
+    {
+        int ret = util_timed_wait_for_fd (logger_fd[0], 5000);
+        if (ret == 0)
+        {
+            global_lock();
+            int loop = (global.running == ICE_RUNNING);
+            global_unlock();
+            if (loop) continue;
+        }
+        if (ret > 0)
+        {
+            char cm[80];
+            ret = pipe_read (logger_fd[0], cm, sizeof cm);
+            if (ret > 0)
+            {
+                // fprintf (stderr, "logger woken with %d\n", ret);
+                log_commit_entries ();
+                continue;
+            }
+        }
+        int err = 0;
+        if (ret < 0 && sock_recoverable ((err = sock_error())) && global.running == ICE_RUNNING)
+            continue;
+        sock_close (logger_fd[0]);
+        if (worker_count)
+        {
+            worker_control_create (logger_fd);
+            ERROR1 ("logger received code %d", err);
+            continue;
+        }
+        log_commit_entries ();
+        // fprintf (stderr, "logger closed with zero workers\n");
+        break;
+    }
+    thread_rwlock_unlock (&global.workers_rw);
+    return NULL;
+}
+
+
+void worker_logger_init (void)
+{
+    worker_control_create (logger_fd);
+    log_set_commit_callback (logger_commits);
+}
+
+void worker_logger (int stop)
+{
+    if (stop)
+    {
+       logger_commits(0);
+       sock_close (logger_fd[1]);
+       logger_fd[1] = -1;
+       return;
+    }
+    thread_create ("Log Thread", log_commit_thread, NULL, THREAD_DETACHED);
+}
+

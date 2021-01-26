@@ -217,11 +217,6 @@ int sock_stalled (int error)
 }
 
 
-static int sock_connect_pending (int error)
-{
-    return error == EINPROGRESS || error == EALREADY;
-}
-
 /* sock_valid_socket
 **
 ** determines if a sock_t represents a valid socket
@@ -252,11 +247,22 @@ int sock_active (sock_t sock)
     return 0;
 }
 
+int sock_peek (sock_t sock, char *arr, int len)
+{
+    int l;
+
+    l = recv (sock, arr, len, MSG_PEEK);
+    if (l > 0 || (l == SOCK_ERROR && sock_recoverable (sock_error())))
+        return l;
+    return 0;
+}
+
+
 /* inet_aton
 **
 ** turns an ascii ip address into a binary representation
 */
-#ifdef _WIN32
+#ifndef HAVE_INET_ATON
 int inet_aton(const char *s, struct in_addr *a)
 {
     int lsb, b2, b3, msb;
@@ -288,7 +294,7 @@ int sock_set_blocking(sock_t sock, int block)
         u_long nonblock = 0;
         if (block == 0)
             nonblock = 1;
-        return ioctlsocket(sock, FIONBIO, &nonblock);
+        return ioctlsocket(sock, FIONBIO, &nonblock) == SOCKET_ERROR ? -1 : 0;
     }
 #else
     return fcntl(sock, F_SETFL, (block) ? 0 : O_NONBLOCK);
@@ -300,6 +306,21 @@ int sock_set_nolinger(sock_t sock)
     struct linger lin = { 0, 0 };
     return setsockopt(sock, SOL_SOCKET, SO_LINGER, (void *)&lin, 
             sizeof(struct linger));
+}
+
+int sock_set_cork (sock_t sock, int yes)
+{
+#if defined (TCP_CORK)
+    int cork = yes ? 1 : 0;
+
+    return setsockopt (sock, IPPROTO_TCP, TCP_CORK, (void *)&cork, sizeof(cork));
+#elif defined BSD_TCP_NOPUSH_WORKS_OR_NOT // may need looking at in more detail
+    int nopush = yes ? 1 : 0;
+
+    return setsockopt (sock, IPPROTO_TCP, TCP_NOPUSH, (void *)&nopush, sizeof(nopush));
+#else
+    return -1;
+#endif
 }
 
 int sock_set_nodelay(sock_t sock)
@@ -703,7 +724,19 @@ sock_t sock_connect_wto (const char *hostname, int port, int timeout)
     return sock_connect_wto_bind(hostname, port, NULL, timeout);
 }
 
+
 #ifdef HAVE_GETADDRINFO
+struct _server_sockets
+{
+    struct addrinfo *res;
+    struct addrinfo *next;
+};
+
+
+static int sock_connect_pending (int error)
+{
+    return error == EINPROGRESS || error == EALREADY;
+}
 
 sock_t sock_connect_non_blocking (const char *hostname, unsigned port)
 {
@@ -822,17 +855,14 @@ sock_t sock_connect_wto_bind (const char *hostname, int port, const char *bnd, i
 }
 
 
-sock_t sock_get_server_socket (int port, const char *sinterface)
+static int sock_alloc_sockets (struct _server_sockets *s, int port, const char *sinterface)
 {
-    struct sockaddr_storage sa;
-    struct addrinfo hints, *res, *ai;
+    struct addrinfo hints;
     char service [10];
-    int sock;
 
     if (port < 0)
         return SOCK_ERROR;
 
-    memset (&sa, 0, sizeof(sa));
     memset (&hints, 0, sizeof(hints));
 
     hints.ai_family = AF_UNSPEC;
@@ -840,39 +870,67 @@ sock_t sock_get_server_socket (int port, const char *sinterface)
     hints.ai_socktype = SOCK_STREAM;
     snprintf (service, sizeof (service), "%d", port);
 
-    if (getaddrinfo (sinterface, service, &hints, &res))
-        return SOCK_ERROR;
-    ai = res;
+    if (getaddrinfo (sinterface, service, &hints, &s->res))
+        return -1;
+    s->next = s->res;
+    return 0;
+}
+
+
+void sock_free_server_sockets (sock_server_t _s)
+{
+    struct _server_sockets *s = _s;
+    if (s == NULL) return;
+    if (s->res)
+        freeaddrinfo (s->res);
+    free (s);
+}
+
+int sock_get_next_server_socket (sock_server_t _s, sock_t *serversock)
+{
+    struct _server_sockets *s = _s;
+    struct addrinfo *ai;
+
+    if (s == NULL || s->next == NULL)
+        return -1;
+    ai = s->next;
     do
     {
         int on = 1;
         int type = ai->ai_socktype;
-        sock = sock_open (ai->ai_family, type, ai->ai_protocol);
+        sock_t sock = sock_open (ai->ai_family, type, ai->ai_protocol);
         if (sock < 0)
             continue;
 
-        setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, (const void *)&on, sizeof(on));
-        on = 0;
+#ifndef WIN32
+        /* reuse it if we can */
+        setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, (void *)&on, sizeof(on));
+#endif
 #ifdef IPV6_V6ONLY
+        on = 1;
         setsockopt (sock, IPPROTO_IPV6, IPV6_V6ONLY, (void*)&on, sizeof on);
 #endif
 
         if (bind (sock, ai->ai_addr, ai->ai_addrlen) < 0)
         {
             sock_close (sock);
-            continue;
+            sock = SOCK_ERROR;
+            // maybe refer to the failed ai for reporting?
         }
-        freeaddrinfo (res);
-        return sock;
+        s->next = ai->ai_next;
+        *serversock = sock;
+        return 0;
 
     } while ((ai = ai->ai_next));
+    s->next = NULL;
 
-    freeaddrinfo (res);
-    return SOCK_ERROR;
+    return -1;
 }
 
 
 #else
+
+#define _server_sockets sockaddr_in
 
 
 int sock_try_connection (sock_t sock, const char *hostname, unsigned int port)
@@ -887,16 +945,10 @@ int sock_try_connection (sock_t sock, const char *hostname, unsigned int port)
     memset(&server, 0, sizeof(struct sockaddr_in));
 
     if (!resolver_getip(hostname, ip, MAX_ADDR_LEN))
-    {
-        sock_close (sock);
         return -1;
-    }
 
     if (inet_aton(ip, (struct in_addr *)&sin.sin_addr) == 0)
-    {
-        sock_close(sock);
         return -1;
-    }
 
     memcpy(&server.sin_addr, &sin.sin_addr, sizeof(struct sockaddr_in));
 
@@ -915,8 +967,11 @@ sock_t sock_connect_non_blocking (const char *hostname, unsigned port)
         return SOCK_ERROR;
 
     sock_set_blocking (sock, 0);
-    sock_try_connection (sock, hostname, port);
-    
+    if (sock_try_connection (sock, hostname, port) < 0)
+    {
+        sock_close (sock);
+        sock = SOCK_ERROR;
+    }
     return sock;
 }
 
@@ -975,60 +1030,114 @@ sock_t sock_connect_wto_bind (const char *hostname, int port, const char *bnd, i
 ** interface.  if interface is null, listen on all interfaces.
 ** returns the socket, or SOCK_ERROR on failure
 */
-sock_t sock_get_server_socket(int port, const char *sinterface)
+static int sock_alloc_sockets (struct _server_sockets *sa, int port, const char *sinterface)
 {
-    struct sockaddr_in sa;
-    int error, opt;
-    sock_t sock;
-    char ip[MAX_ADDR_LEN];
+    if (port < 0 || sa == NULL)
+        return -1;
+    do
+    {
+        /* set the interface to bind to if specified */
+        if (sinterface)
+        {
+            char ip[MAX_ADDR_LEN];
 
-    if (port < 0)
-        return SOCK_ERROR;
+            if (!resolver_getip (sinterface, ip, sizeof (ip)))
+                break;
 
-    /* defaults */
-    memset(&sa, 0, sizeof(sa));
-
-    /* set the interface to bind to if specified */
-    if (sinterface != NULL) {
-        if (!resolver_getip(sinterface, ip, sizeof (ip)))
-            return SOCK_ERROR;
-
-        if (!inet_aton(ip, &sa.sin_addr)) {
-            return SOCK_ERROR;
-        } else {
-            sa.sin_family = AF_INET;
-            sa.sin_port = htons((short)port);
+            if (!inet_aton (ip, &sa->sin_addr))
+                break;
         }
-    } else {
-        sa.sin_addr.s_addr = INADDR_ANY;
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons((short)port);
-    }
+        else
+        {
+            sa->sin_addr.s_addr = INADDR_ANY;
+        }
+        sa->sin_family = AF_INET;
+        sa->sin_port = htons((short)port);
+
+        return 0;
+    } while (1);
+
+    return -1;
+}
+
+
+int sock_get_next_server_socket (sock_server_t _s, sock_t *serversock)
+{
+    struct sockaddr_in *sa = _s;
+    sock_t sock;
+    int error;
+
+    if (sa == NULL) return SOCK_ERROR;
 
     /* get a socket */
     sock = sock_open (AF_INET, SOCK_STREAM, 0);
     if (sock == -1)
-        return SOCK_ERROR;
+        return -1;
 
     sock_set_cloexec (sock);
-    /* reuse it if we can */
-    opt = 1;
 #ifndef WIN32
+    /* reuse it if we can */
+    int opt = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const void *)&opt, sizeof(int));
 #endif
 
     /* bind socket to port */
-    error = bind(sock, (struct sockaddr *)&sa, sizeof (struct sockaddr_in));
+    error = bind (sock, (struct sockaddr *)sa, sizeof (struct sockaddr_in));
     if (error == -1)
     {
         sock_close (sock);
-        sock =  SOCK_ERROR;
+        sock = SOCK_ERROR;
     }
+    *serversock = sock;
 
+    return 0;
+}
+
+void sock_free_server_sockets (sock_server_t _s)
+{
+    struct _server_sockets *s = _s;
+    free (s);
+}
+#endif
+
+void *sock_get_server_sockets (int port, const char *sinterface)
+{
+    struct _server_sockets *s = calloc (1, sizeof (*s));
+
+    int ret = sock_alloc_sockets (s, port, sinterface);
+    if (ret == 0)
+        return s;
+    free (s);
+    return NULL;
+}
+
+sock_t sock_get_server_socket (int port, const char *sinterface)
+{
+    struct _server_sockets *s = calloc (1, sizeof (*s));
+
+    if (sock_alloc_sockets (s, port, sinterface) < 0)
+        return SOCK_ERROR;
+    sock_t sock = SOCK_ERROR;
+    sock_get_next_server_socket (s, &sock);
+    sock_free_server_sockets (s);
     return sock;
 }
 
+void sock_set_mss (sock_t sock, int mss_size)
+{
+#ifndef _WIN32
+    if (setsockopt (sock, IPPROTO_TCP, TCP_MAXSEG, (char *) &mss_size, sizeof(mss_size)) == 0)
+    {
+#if 0
+        int new_mss = 0;
+        socklen_t len = sizeof (new_mss);
+        int rc = getsockopt(sock, IPPROTO_TCP, TCP_MAXSEG, (char *) &new_mss, &len);
+        if (rc == 0)
+            printf ("mss is %d\n", new_mss);
 #endif
+    }
+#endif
+}
 
 void sock_set_send_buffer (sock_t sock, int win_size)
 {
@@ -1080,7 +1189,7 @@ sock_t sock_accept(sock_t serversock, char *ip, size_t len)
 }
 
 #ifdef _WIN32
-int sock_create_pipe_emulation (int handles[2])
+int sock_create_pipe_emulation (SOCKET handles[2])
 {
     sock_t s;
     struct  sockaddr_in serv_addr;

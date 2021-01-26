@@ -14,6 +14,10 @@
 #include <config.h>
 #endif
 
+#ifdef HAVE_WINSOCK2_H
+#include <winsock2.h>
+#endif
+
 #include <string.h>
 #include <libxml/xmlmemory.h>
 #include <libxml/debugXML.h>
@@ -192,6 +196,9 @@ void xslt_initialize(void)
     thread_rwlock_create (&xslt_lock);
     thread_spin_create (&update_lock);
     xsl_updating = 0;
+#ifdef MY_ALLOC
+    xmlMemSetup(xmlMemFree, xmlMemMalloc, xmlMemRealloc, xmlMemoryStrdup);
+#endif
     xmlInitParser();
     LIBXML_TEST_VERSION
     xmlSubstituteEntitiesDefault(1);
@@ -467,7 +474,7 @@ static int xslt_send_sheet (client_t *client, xmlDocPtr doc, int idx)
     else
     {
         /* the 100 is to allow for the hardcoded headers */
-        refbuf_t *refbuf = refbuf_new (500);
+        refbuf_t *refbuf = refbuf_new (1000);
         const char *mediatype = NULL;
 
         /* lets find out the content type to use */
@@ -484,19 +491,17 @@ static int xslt_send_sheet (client_t *client, xmlDocPtr doc, int idx)
                 else
                     mediatype = "text/xml";
         }
-        snprintf (refbuf->data, 500,
+        int bytes = snprintf (refbuf->data, 1000,
                 "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\n%s"
                 "Expires: Thu, 19 Nov 1981 08:52:00 GMT\r\n"
                 "Cache-Control: no-store, no-cache, must-revalidate\r\n"
-                "Pragma: no-cache\r\n%s\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Access-Control-Allow-Headers: Origin, Accept, X-Requested-With, Content-Type\r\n"
-                "Access-Control-Allow-Methods: GET, OPTIONS, HEAD\r\n"
-                "\r\n",
+                "Pragma: no-cache\r\n%s\r\n",
                 mediatype, len,
                 cache[idx].disposition ? cache[idx].disposition : "", client_keepalive_header (client));
 
         thread_rwlock_unlock (&xslt_lock);
+        if (bytes < 1000)
+            client_add_cors (client, refbuf->data+bytes, 1000-bytes);
         client->respcode = 200;
         client_set_queue (client, NULL);
         client->refbuf = refbuf;

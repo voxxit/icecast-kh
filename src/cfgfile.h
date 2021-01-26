@@ -49,7 +49,7 @@ typedef struct access_log
     int type;
     int archive;
     int display;
-    int size;
+    long size;
     unsigned duration;
     char *exclude_ext;
 } access_log;
@@ -63,7 +63,7 @@ typedef struct error_log
     int logid;
     int archive;
     int display;
-    int size;
+    long size;
     unsigned duration;
     int level;
 } error_log;
@@ -74,9 +74,11 @@ typedef struct playlist_log
     int logid;
     int archive;
     int display;
-    int size;
+    long size;
     unsigned duration;
 } playlist_log;
+
+typedef struct error_log preroll_log;
 
 
 typedef struct ice_config_dir_tag
@@ -120,22 +122,21 @@ typedef struct _mount_proxy {
     int no_mount; /* Do we permit direct requests of this mountpoint? (or only
                      indirect, through fallbacks) */
     int so_sndbuf;      /* TCP send buffer size for new clients */
-    int burst_size; /* amount to send to a new client if possible, -1 take
-                     * from global setting */
-    int min_queue_size;     /* minimum length of queue */
-    unsigned int queue_size_limit;
+    uint32_t burst_size;
+    uint32_t min_queue_size;     /* minimum length of queue */
+    uint32_t queue_size_limit;
     int hidden; /* Do we list this on the xsl pages */
     unsigned int source_timeout;  /* source timeout in seconds */
     char *charset;  /* character set if not utf8 */
     int allow_chunked; /* allow chunked transfers */
     int mp3_meta_interval; /* outgoing per-stream metadata interval */
-    int queue_block_size; /* for non-ogg streams, try to create blocks of this size */
     int max_send_size;
     int filter_theora; /* prevent theora pages getting queued */
     int url_ogg_meta; /* enable to allow updates via url requests for ogg */
     int ogg_passthrough; /* enable to prevent the ogg stream being rebuilt */
     int admin_comments_only; /* enable to only show comments set from the admin page */
     int skip_accesslog;         /* skip logging client to access log */
+    int intro_skip_replay;      /* duration to cache IPs, for intro playing */
 
     int64_t limit_rate;
 
@@ -152,6 +153,7 @@ typedef struct _mount_proxy {
     unsigned int max_listener_duration;
 
     struct access_log      access_log;
+    preroll_log     preroll_log;
 
     char *redirect;
     char *stream_name;
@@ -193,6 +195,7 @@ struct _listener_t
     int shoutcast_compat;
     int ssl;
     int so_sndbuf;
+    int so_mss;
 };
 
 
@@ -245,6 +248,7 @@ typedef struct ice_config_tag
 {
     char *config_filename;
 
+    char *gitversion;
     char *location;
     char *admin;
 
@@ -253,12 +257,13 @@ typedef struct ice_config_tag
     unsigned int queue_size_limit;
     int min_queue_size;
     int workers_count;
-    unsigned int burst_size;
+    uint32_t burst_size;
     int client_timeout;
     int header_timeout;
     int source_timeout;
     int ice_login;
     int64_t max_bandwidth;
+    int max_listeners;
     int fileserve;
     int on_demand; /* global setting for all relays */
 
@@ -287,8 +292,10 @@ typedef struct ice_config_tag
     char *master_username;
     char *master_password;
     int master_relay_auth;
+    int master_relay_retry;
     int master_ssl_port;
     int master_redirect;
+    int master_run_on;
     int max_redirects;
     struct _redirect_host *redirect_hosts;
     struct xforward_entry *xforward;
@@ -296,6 +303,7 @@ typedef struct ice_config_tag
     relay_server *relays;
 
     mount_proxy *mounts;
+    avl_tree *mounts_tree;
 
     char *server_id;
     char *base_dir;
@@ -305,6 +313,8 @@ typedef struct ice_config_tag
     char *allowfile;
     char *agentfile;
     char *cert_file;
+    char *key_file;
+    char *ca_file;
     char *cipher_list;
     char *webroot_dir;
     char *adminroot_dir;
@@ -314,6 +324,7 @@ typedef struct ice_config_tag
     struct access_log      access_log;
     struct error_log       error_log;
     struct playlist_log    playlist_log;
+    preroll_log     preroll_log;
 
     int chroot;
     int chuid;
@@ -341,6 +352,7 @@ relay_server *config_clear_relay (relay_server *relay);
 void config_clear(ice_config_t *config);
 mount_proxy *config_find_mount (ice_config_t *config, const char *mount);
 void config_xml_parse_failure (void*x,  xmlErrorPtr error);
+int config_qsizing_conv_a2n (const char *str, uint32_t *p);
 
 int config_rehash(void);
 

@@ -24,6 +24,7 @@
 #ifndef WIN32
 #include <unistd.h>
 #else
+#include <winsock2.h>
 #include <windows.h>
 #include <winbase.h>
 #endif
@@ -32,6 +33,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/types.h>
+#include "global.h"
 
 #ifdef TIME_WITH_SYS_TIME
 #  include <sys/time.h>
@@ -325,7 +327,7 @@ thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
         start->arg = arg;
         start->thread = thread;
 
-        pthread_attr_setstacksize (&attr, 2048*1024);
+        pthread_attr_setstacksize (&attr, 1024*1024);
         pthread_attr_setinheritsched (&attr, PTHREAD_INHERIT_SCHED);
         if (detached)
         {
@@ -350,7 +352,11 @@ thread_type *thread_create_c(char *name, void *(*start_routine)(void *),
     LOG_ERROR1("Could not create new thread %s", name);
 #endif
     if (start) free (start);
-    if (thread) free (thread);
+    if (thread)
+    {
+        free (thread->name);
+        free (thread);
+    }
     return NULL;
 }
 
@@ -410,7 +416,7 @@ void thread_mutex_destroy_c (mutex_t *mutex, int line, const char *file)
 #endif
 }
 
-void thread_mutex_lock_c(mutex_t *mutex, int line, char *file)
+void thread_mutex_lock_c(mutex_t *mutex, int line, const char *file)
 {
 #ifdef THREAD_DEBUG
     LOG_DEBUG3("Lock on %s requested at %s:%d", mutex->name, file, line);
@@ -418,13 +424,13 @@ void thread_mutex_lock_c(mutex_t *mutex, int line, char *file)
     _mutex_lock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
     mutex->lock_start = get_count();
-    mutex->file = file;
+    mutex->file = (char*)file;
     mutex->line = line;
     LOG_DEBUG3("Lock on %s acquired at %s:%d", mutex->name, file, line);
 #endif /* THREAD_DEBUG */
 }
 
-void thread_mutex_unlock_c(mutex_t *mutex, int line, char *file)
+void thread_mutex_unlock_c(mutex_t *mutex, int line, const char *file)
 {
     _mutex_unlock_c(mutex, file, line);
 #ifdef THREAD_DEBUG
@@ -484,12 +490,10 @@ void thread_cond_wait_c(cond_t *cond, mutex_t *mutex,int line, char *file)
 
 void thread_rwlock_create_c(const char *name, rwlock_t *rwlock, int line, const char *file)
 {
-#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NP
-    pthread_rwlockattr_t attr;
-    pthread_rwlockattr_init (&attr);
-    pthread_rwlockattr_setkind_np (&attr, PTHREAD_RWLOCK_PREFER_WRITER_NP);
-    pthread_rwlock_init(&rwlock->sys_rwlock, &attr);
-    pthread_rwlockattr_destroy (&attr);
+#if defined (PTHREAD_RWLOCK_WRITER_NONRECURSIVE_INITIALIZER_NP)
+    // later glibc ignores PTHREAD_RWLOCK_PREFER_WRITER_NP for deadlock cases if recursive calls are used. we
+    // assume that is never done so should never be a problem.  these look to be enums not defines
+    rwlock->sys_rwlock = (pthread_rwlock_t) PTHREAD_RWLOCK_WRITER_NONRECURSIVE_INITIALIZER_NP;
 #else
     // win32 at least has issues if attributes are passed
     pthread_rwlock_init(&rwlock->sys_rwlock, NULL);
@@ -585,6 +589,27 @@ void thread_rwlock_wlock_c(rwlock_t *rwlock, int line, const char *file)
 #endif
 }
 
+
+int thread_rwlock_trywlock_c(rwlock_t *rwlock, int line, const char *file)
+{
+    int ret = pthread_rwlock_trywrlock (&rwlock->sys_rwlock);
+#ifdef THREAD_DEBUG
+    LOG_DEBUG3("trywLock on %s requested at %s:%d", rwlock->name, file, line);
+#endif
+    switch (ret)
+    {
+        default:
+            log_write (thread_log, 1, "thread/", "rwlock", "try wlock error triggered at %p, %s:%d (%d)", rwlock, file, line, ret);
+            abort();
+        case 0:
+            return 0;
+        case EBUSY:
+        case EAGAIN:
+            return -1;
+    }
+}
+
+
 void thread_rwlock_unlock_c(rwlock_t *rwlock, int line, const char *file)
 {
     int rc = pthread_rwlock_unlock(&rwlock->sys_rwlock);
@@ -640,7 +665,7 @@ void thread_exit_c(long val, int line, char *file)
         _mutex_unlock(&_threadtree_mutex);
     }
 
-    pthread_exit ((void*)val);
+    pthread_exit ((void*)(uintptr_t)val);
 }
 
 /* sleep for a number of microseconds */
@@ -818,14 +843,13 @@ void thread_library_unlock(void)
 void thread_join(thread_type *thread)
 {
     void *ret;
-    int i;
 
 #ifdef __OpenBSD__
     /* openbsd masks signals while waiting */
     while (thread->running)
         thread_sleep (200000);
 #endif
-    i = pthread_join(thread->sys_thread, &ret);
+    pthread_join (thread->sys_thread, &ret);
     _mutex_lock(&_threadtree_mutex);
     avl_delete(_threadtree, thread, _free_thread);
     _mutex_unlock(&_threadtree_mutex);
@@ -963,3 +987,42 @@ void thread_time_add_ms (struct timespec *ts, unsigned long value)
     }
 }
 
+
+int thread_mtx_create_callback (void **p, int alloc)
+{
+    mutex_t *mutex;
+    if (p == NULL)
+        return -1;
+    if (alloc)
+    {
+        mutex = malloc (sizeof(mutex_t));
+        thread_mutex_create (mutex);
+        *p = mutex;
+    }
+    else
+    {
+        mutex = *p;
+        thread_mutex_destroy (mutex);
+        free (mutex);
+        *p = NULL;
+    }
+    return 0;
+}
+
+
+int thread_mtx_lock_callback (void **p, int lock)
+{
+    mutex_t *mutex;
+    if (p == NULL)
+        return -1;
+    mutex = *p;
+    if (lock)
+    {
+        thread_mutex_lock (mutex);
+    }
+    else
+    {
+        thread_mutex_unlock (mutex);
+    }
+    return 0;
+}

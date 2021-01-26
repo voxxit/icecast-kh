@@ -21,6 +21,7 @@
 
 #include <avl/avl.h>
 #include "httpp.h"
+#include "global.h"
 
 #if defined(_WIN32) && !defined(HAVE_STRCASECMP)
 #define strcasecmp stricmp
@@ -92,13 +93,12 @@ static int split_headers(char *data, unsigned long len, char **line)
 static void parse_headers(http_parser_t *parser, char **line, int lines)
 {
     int i,l;
-    int whitespace, where, slen;
+    int whitespace, slen;
     char *name = NULL;
     char *value = NULL;
 
     /* parse the name: value lines. */
     for (l = 1; l < lines; l++) {
-        where = 0;
         whitespace = 0;
         name = line[l];
         value = NULL;
@@ -391,11 +391,17 @@ int httpp_parse(http_parser_t *parser, const char *http_data, unsigned long len)
 
     if (parser->req_type != httpp_req_none && parser->req_type != httpp_req_unknown) {
         switch (parser->req_type) {
+        case httpp_req_put:
+            httpp_setvar(parser, HTTPP_VAR_REQ_TYPE, "PUT");
+            break;
         case httpp_req_get:
             httpp_setvar(parser, HTTPP_VAR_REQ_TYPE, "GET");
             break;
         case httpp_req_post:
             httpp_setvar(parser, HTTPP_VAR_REQ_TYPE, "POST");
+            break;
+        case httpp_req_options:
+            httpp_setvar(parser, HTTPP_VAR_REQ_TYPE, "OPTIONS");
             break;
         case httpp_req_head:
             httpp_setvar(parser, HTTPP_VAR_REQ_TYPE, "HEAD");

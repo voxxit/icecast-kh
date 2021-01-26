@@ -96,14 +96,14 @@ static void _print_usage(void)
 
 void initialize_subsystems(void)
 {
-    log_initialize();
-    errorlog = log_open_file (stderr);
+    global_initialize();
     thread_initialize();
+    log_initialize_lib (thread_mtx_create_callback, thread_mtx_lock_callback);
+    errorlog = log_open_file (stderr);
     sock_initialize();
     resolver_initialize();
     config_initialize();
     connection_initialize();
-    global_initialize();
     refbuf_initialize();
 
     stats_initialize();
@@ -118,25 +118,21 @@ void shutdown_subsystems(void)
 {
     connection_shutdown();
     slave_shutdown();
-    fserve_shutdown();
-    stats_shutdown();
-    stop_logging();
+    xslt_shutdown();
 
     config_shutdown();
     refbuf_shutdown();
     resolver_shutdown();
     sock_shutdown();
 
-    DEBUG0 ("library cleanups");
 #ifdef HAVE_CURL
     curl_global_cleanup();
 #endif
 
     /* Now that these are done, we can stop the loggers. */
     log_shutdown();
-    xslt_shutdown();
-    thread_shutdown();
     global_shutdown();
+    thread_shutdown();
 }
 
 static int _parse_config_opts(int argc, char **argv, char *filename, int size)
@@ -191,17 +187,19 @@ static int _parse_config_opts(int argc, char **argv, char *filename, int size)
 
 
 /* bind the socket and start listening */
-static int _server_proc_init(void)
+static int server_proc_init(void)
 {
     ice_config_t *config = config_get_config_unlocked();
 
-    if (config->chuid && connection_setup_sockets (config) == 0)
+    if (init_logging (config) < 0)
+        return 0;
+
+    INFO2 ("%s server reading configuration from %s", ICECAST_VERSION_STRING, config->config_filename);
+
+    if (connection_setup_sockets (config) == 0)
         return 0;
 
     _ch_root_uid_setup(); /* Change user id and root if requested/possible */
-
-    if (config->chuid == 0 && connection_setup_sockets (config) == 0)
-        return 0;
 
     /* recreate the pid file */
     if (config->pidfile)
@@ -330,7 +328,7 @@ static void _ch_root_uid_setup(void)
            else
                fprintf (stdout, "Changed supplementary groups based on user: %s.\n", conf->user);
 #ifdef HAVE_SETRESGID
-           if (setresgid (uid, uid, uid) < 0)
+           if (setresgid (gid, gid, gid) < 0)
 #else
            if (setgid (gid) < 0)
 #endif
@@ -399,7 +397,7 @@ int server_init (int argc, char *argv[])
     config_parse_cmdline(argc, argv);
 
     /* Bind socket, before we change userid */
-    if (_server_proc_init() == 0)
+    if (server_proc_init() == 0)
     {
         _fatal_error("Server startup failed. Exiting");
         return -1;

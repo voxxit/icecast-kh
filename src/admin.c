@@ -84,7 +84,6 @@ struct admin_command
 static struct admin_command admin_general[] =
 {
     { "managerelays",       RAW,    { command_manage_relay } },
-    { "manageauth",         RAW,    { command_manageauth } },
     { "listmounts",         RAW,    { command_list_mounts } },
     { "function",           RAW,    { command_admin_function } },
 #ifdef MY_ALLOC
@@ -95,7 +94,6 @@ static struct admin_command admin_general[] =
     { "showlog.txt",        TEXT,   { command_list_log } },
     { "showlog.xsl",        XSLT,   { command_list_log } },
     { "managerelays.xsl",   XSLT,   { command_manage_relay } },
-    { "manageauth.xsl",     XSLT,   { command_manageauth } },
     { "listmounts.xsl",     XSLT,   { command_list_mounts } },
     { "moveclients.xsl",    XSLT,   { command_list_mounts } },
     { "function.xsl",       XSLT,   { command_admin_function } },
@@ -269,10 +267,25 @@ static struct admin_command *find_admin_command (struct admin_command *list, con
 }
 
 
-int admin_mount_request (client_t *client, const char *uri)
+// wrapper to free up memory allocated for moved client.
+static void admin_client_destroy (client_t *client)
+{
+    free ((void*)client->aux_data);
+    client_destroy (client);
+}
+
+struct _client_functions admin_mount_ops =
+{
+    admin_mount_request,
+    admin_client_destroy
+};
+
+
+int admin_mount_request (client_t *client)
 {
     source_t *source;
-    const char *mount = httpp_get_query_param (client->parser, "mount");
+    const char *mount = client->mount;
+    char *uri = (void*)client->aux_data;
 
     struct admin_command *cmd = find_admin_command (admin_mount, uri);
 
@@ -283,6 +296,16 @@ int admin_mount_request (client_t *client, const char *uri)
     {
         INFO0("mount request not recognised");
         return client_send_400 (client, "unknown request");
+    }
+
+    if ((client->flags & CLIENT_ACTIVE) == 0)   // non-worker to kick it back to worker.
+    {
+        worker_t *worker = client->worker;
+        DEBUG0 ("client passed auth, but on different thread to src, reschedule on worker");
+        client->mount = httpp_get_query_param (client->parser, "mount");
+        client->flags |= CLIENT_ACTIVE;
+        worker_wakeup (worker);
+        return 0;
     }
 
     avl_tree_rlock(global.source_tree);
@@ -298,11 +321,23 @@ int admin_mount_request (client_t *client, const char *uri)
         if (strncmp (cmd->request, "killclient", 10) == 0)
             return fserve_kill_client (client, mount, cmd->response);
         WARN1("Admin command on non-existent source %s", mount);
+        free (uri);
         return client_send_400 (client, "Source does not exist");
     }
     else
     {
         int ret = 0;
+
+        // see if we should move workers. avoid excessive write lock bubbles in worker run queue
+        worker_t *src_worker = source->client->worker;
+        if (src_worker != client->worker)
+        {
+            client->ops = &admin_mount_ops;
+            avl_tree_unlock (global.source_tree);
+            // DEBUG0 (" moving admin request to alternate worker");
+            return client_change_worker (client, src_worker);
+        }
+        free (uri);
         thread_rwlock_wlock (&source->lock);
         if (source_available (source) == 0)
         {
@@ -311,8 +346,8 @@ int admin_mount_request (client_t *client, const char *uri)
             INFO1("Received admin command on unavailable mount \"%s\"", mount);
             return client_send_400 (client, "Source is not available");
         }
-        ret = cmd->handle.source (client, source, cmd->response);
         avl_tree_unlock(global.source_tree);
+        ret = cmd->handle.source (client, source, cmd->response);
         return ret;
     }
 }
@@ -330,15 +365,34 @@ int admin_handle_request (client_t *client, const char *uri)
         uri++;
         if (mount == NULL)
         {
-            if (client->server_conn && client->server_conn->shoutcast_mount)
-                httpp_set_query_param (client->parser, "mount",
-                        client->server_conn->shoutcast_mount);
+            char *mount_pass = strdup (pass);
+            char *sep = strchr (mount_pass, ':');
+            mount = client->server_conn->shoutcast_mount;
+            if (sep && pass[0] == '/' && sep[1] != '\0')
+            {
+                mount = mount_pass;
+                *sep = '\0';
+                pass = sep + 1;
+                // DEBUG2 ("admin.cgi, Using mount %s, pass %s", mount, pass);
+                client->password = strdup (pass);
+            }
+            if (mount == NULL)
+            {
+                free (mount_pass);
+                return client_send_400 (client, "unknown mountpoint");
+            }
+            httpp_set_query_param (client->parser, "mount", mount);
+            httpp_setvar (client->parser, HTTPP_VAR_ICYPASSWORD, pass);
+            free (mount_pass);
             mount = httpp_get_query_param (client->parser, "mount");
         }
+        else
+        {
+            httpp_setvar (client->parser, HTTPP_VAR_ICYPASSWORD, pass);
+            client->password = strdup (pass);
+        }
         httpp_setvar (client->parser, HTTPP_VAR_PROTOCOL, "ICY");
-        httpp_setvar (client->parser, HTTPP_VAR_ICYPASSWORD, pass);
         client->username = strdup ("source");
-        client->password = strdup (pass);
     }
     else
         uri += 7;
@@ -358,6 +412,9 @@ int admin_handle_request (client_t *client, const char *uri)
     if (mount)
     {
         xmlSetStructuredErrorFunc ((char*)mount, config_xml_parse_failure);
+        client->mount = mount;
+        client->aux_data = (int64_t)strdup (uri);
+
         /* no auth/stream required for this */
         if (strcmp (uri, "buildm3u") == 0)
             return command_buildm3u (client, mount);
@@ -382,7 +439,7 @@ int admin_handle_request (client_t *client, const char *uri)
         }
         if (strcmp (uri, "streams") == 0)
             return auth_add_listener ("/admin/streams", client);
-        return admin_mount_request (client, uri);
+        return admin_mount_request (client);
     }
 
     return admin_handle_general_request (client, uri);
@@ -733,6 +790,7 @@ static int command_buildm3u (client_t *client, const char *mount)
     const char *password = NULL;
     ice_config_t *config;
     const char *host = httpp_getvar (client->parser, "host");
+    const char *protocol = not_ssl_connection (&client->connection) ? "http" : "https";
 
     if (COMMAND_REQUIRE(client, "username", username) < 0 ||
             COMMAND_REQUIRE(client, "password", password) < 0)
@@ -749,8 +807,8 @@ static int command_buildm3u (client_t *client, const char *mount)
                 "HTTP/1.0 200 OK\r\n"
                 "Content-Type: audio/x-mpegurl\r\n"
                 "Content-Disposition: attachment; filename=\"listen.m3u\"\r\n\r\n"
-                "http://%s:%s@%s%s%s\r\n",
-                username, password,
+                "%s://%s:%s@%s%s%s\r\n",
+                protocol, username, password,
                 host, port, mount);
     }
     else
@@ -759,8 +817,8 @@ static int command_buildm3u (client_t *client, const char *mount)
                 "HTTP/1.0 200 OK\r\n"
                 "Content-Type: audio/x-mpegurl\r\n"
                 "Content-Disposition: attachment; filename=\"listen.m3u\"\r\n\r\n"
-                "http://%s:%s@%s:%d%s\r\n",
-                username, password,
+                "%s://%s:%s@%s:%d%s\r\n",
+                protocol, username, password,
                 config->hostname, config->port, mount);
     }
     config_release_config();
@@ -951,7 +1009,7 @@ static int command_fallback (client_t *client, source_t *source, int response)
 
 static int command_metadata (client_t *client, source_t *source, int response)
 {
-    const char *song, *title, *artist, *artwork, *charset, *url;
+    const char *song, *title, *artist, *artwork, *charset, *url, *intro;
     format_plugin_t *plugin;
     xmlDocPtr doc;
     xmlNodePtr node;
@@ -969,6 +1027,9 @@ static int command_metadata (client_t *client, source_t *source, int response)
     COMMAND_OPTIONAL(client, "url", url);
     COMMAND_OPTIONAL(client, "artwork", artwork);
     COMMAND_OPTIONAL(client, "charset", charset);
+    COMMAND_OPTIONAL(client, "intro", intro);
+    if (intro == NULL)
+        COMMAND_OPTIONAL(client, "preroll", intro);
 
     plugin = source->format;
     if (source_running (source))
@@ -982,6 +1043,10 @@ static int command_metadata (client_t *client, source_t *source, int response)
             break;
         if (artwork)
             stats_event (source->mount, "artwork", artwork);
+        if (intro)
+        {
+            source_set_intro (source, intro);
+        }
         if (plugin->set_tag)
         {
             if (url)
@@ -1117,6 +1182,7 @@ static int command_list_log (client_t *client, int response)
     refbuf_t *content;
     const char *logname = httpp_get_query_param (client->parser, "log");
     int log = -1;
+    unsigned int len = 0;
     ice_config_t *config;
 
     if (logname == NULL)
@@ -1130,13 +1196,13 @@ static int command_list_log (client_t *client, int response)
     else if (strcmp (logname, "playlistlog") == 0)
         log = config->playlist_log.logid;
 
-    if (log < 0)
+    if (log_contents (log, NULL, &len) < 0)
     {
         config_release_config();
         WARN1 ("request to show unknown log \"%s\"", logname);
         return client_send_400 (client, "unknown");
     }
-    content = refbuf_new (0);
+    content = refbuf_new (len+1);
     log_contents (log, &content->data, &content->len);
     config_release_config();
 
@@ -1161,7 +1227,8 @@ static int command_list_log (client_t *client, int response)
         http->len = len;
         http->next = content; 
         client->respcode = 200;
-        client_set_queue (client, http);
+        client_set_queue (client, NULL);
+        client->refbuf = http;
         return fserve_setup_client (client);
     }
 }
@@ -1223,14 +1290,18 @@ static int command_alloc(client_t *client)
     xmlDocPtr doc = xmlNewDoc (XMLSTR("1.0"));
     xmlNodePtr rootnode = xmlNewDocNode(doc, NULL, XMLSTR("icestats"), NULL);
     avl_node *node;
+    char value[25];
 
     xmlDocSetRootElement(doc, rootnode);
+
+    snprintf (value, sizeof value, "%d", xmlMemUsed());
+    xmlNewChild (rootnode, NULL, XMLSTR("libxml_mem"), XMLSTR(value));
+
     avl_tree_rlock (global.alloc_tree);
     node = avl_get_first (global.alloc_tree);
     while (node)
     {
         alloc_node *an = node->key;
-        char value[25];
         xmlNodePtr bnode = xmlNewChild (rootnode, NULL, XMLSTR("block"), NULL);
         xmlSetProp (bnode, XMLSTR("name"), XMLSTR(an->name));
         snprintf (value, sizeof value, "%d", an->count);

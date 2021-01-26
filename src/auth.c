@@ -125,6 +125,8 @@ static auth_client *auth_client_setup (const char *mount, client_t *client)
     auth_user->hostname = strdup (config->hostname);
     auth_user->port = config->port;
     auth_user->client = client;
+    if (client)
+        client->mount = auth_user->mount;
     return auth_user;
 }
 
@@ -186,6 +188,7 @@ static void queue_auth_client (auth_client *auth_user, mount_proxy *mountinfo)
  */
 void auth_release (auth_t *authenticator)
 {
+    if (authenticator == NULL) return;
     authenticator->refcount--;
     DEBUG2 ("...refcount on auth_t %s is now %d", authenticator->mount, authenticator->refcount);
     if (authenticator->refcount)
@@ -245,7 +248,7 @@ static void auth_new_listener (auth_client *auth_user)
      * can be avoided if client has disconnected */
     if (allow_auth == 0 || client_connected (client) == 0)
     {
-        DEBUG0 ("dropping listener connection");
+        DEBUG1 ("dropping listener #%" PRIu64 " connection", client->connection.id);
         client->respcode = 400;
         return;
     }
@@ -260,8 +263,7 @@ static void auth_new_listener (auth_client *auth_user)
                 return;
         }
     }
-    if (auth_postprocess_listener (auth_user) < 0)
-        DEBUG0 ("listener connection failed");
+    auth_postprocess_listener (auth_user);
 }
 
 
@@ -278,6 +280,7 @@ static void auth_remove_listener (auth_client *auth_user)
     {
         client_t *client = auth_user->client;
         client->flags &= ~CLIENT_AUTHENTICATED;
+        DEBUG1 ("client #%" PRIu64 " completed", client->connection.id);
         if (client->worker)
             client_send_404 (client, NULL);
         else
@@ -519,6 +522,7 @@ static int add_authenticated_listener (const char *mount, mount_proxy *mountinfo
             httpp_deletevar (client->parser, "range");
             client->flags |= CLIENT_NO_CONTENT_LENGTH;
         }
+        client->mount = mount;
         ret = fserve_client_create (client, mount);
     }
     return ret;
@@ -545,6 +549,7 @@ static int auth_postprocess_listener (auth_client *auth_user)
             mount = auth->rejected_mount;
         else
         {
+            DEBUG1 ("listener #%" PRIu64 " rejected", client->connection.id);
             client_send_401 (client, auth_user->auth->realm);
             return -1;
         }
@@ -572,7 +577,9 @@ void auth_postprocess_source (auth_client *auth_user)
     if (strcmp (req, "/admin.cgi") == 0 || strncmp ("/admin/metadata", req, 15) == 0)
     {
         DEBUG2 ("metadata request (%s, %s)", req, mount);
-        admin_mount_request (client, "metadata");
+        client->mount = mount;
+        client->aux_data = (int64_t)strdup("metadata");
+        admin_mount_request (client);
     }
     else
     {
@@ -607,14 +614,17 @@ int auth_add_listener (const char *mount, client_t *client)
                         pos2 = 0;
             }
             else
+            {
+                INFO2 ("range header \"%.50s\" from %s", range, &client->connection.ip[0]);
                 pos2 = 0;
+            }
 
-            if (pos2 > 0 && pos1 < pos2)
+            if (pos2 >= 0 && pos1 <= pos2)
             {
                 client->intro_offset = pos1;
                 client->connection.discon.offset = pos2;
                 client->flags |= CLIENT_RANGE_END;
-                if (pos2 - pos1 < 10)
+                if (pos2 - pos1 < 100)
                     need_auth = 0; // avoid auth check if range is very small, player hack
             }
             else
@@ -648,11 +658,16 @@ int auth_add_listener (const char *mount, client_t *client)
             }
             if (mountinfo->redirect)
             {
-                int len = strlen (mountinfo->redirect) + strlen (mount) + 3;
-                char *addr = alloca (len);
-                snprintf (addr, len, "%s%s", mountinfo->redirect, mount);
-                config_release_config ();
-                return client_send_302 (client, addr);
+                char buffer [4096] = "";
+                unsigned int len = sizeof buffer;
+
+                if (util_expand_pattern (mount, mountinfo->redirect, buffer, &len) == 0)
+                {
+                    config_release_config ();
+                    return client_send_302 (client, buffer);
+                }
+                WARN3 ("failed to expand %s on %s for %s", mountinfo->redirect, mountinfo->mountname, mount);
+                return client_send_501 (client);
             }
             do
             {
@@ -672,7 +687,7 @@ int auth_add_listener (const char *mount, client_t *client)
                     auth_client *auth_user = auth_client_setup (mount, client);
                     auth_user->process = auth_new_listener;
                     client->flags &= ~CLIENT_ACTIVE;
-                    DEBUG0 ("adding client for authentication");
+                    DEBUG1 ("adding client #%" PRIu64 " for authentication", client->connection.id);
                     queue_auth_client (auth_user, mountinfo);
                     config_release_config ();
                     return 0;
@@ -836,7 +851,7 @@ int auth_get_authenticator (xmlNodePtr node, void *x)
         /* allocate N threads */
         auth->handles = calloc (auth->handlers, sizeof (auth_thread_t));
         auth->refcount = 1;
-        auth->flags |= AUTH_RUNNING;
+        auth->flags |= (AUTH_RUNNING|AUTH_CLEAN_ENV);
         for (i=0; i<auth->handlers; i++)
         {
             if (auth->alloc_thread_data)
